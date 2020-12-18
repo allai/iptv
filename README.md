@@ -13,8 +13,7 @@ wget -q http://hbo.epub.fun/v2.sh && bash v2.sh
 
 ```
 
-- 多用户多账号管理
-- 代理转发账号管理
+- 重写中
   
 ---
 
@@ -122,7 +121,7 @@ wget -q http://hbo.epub.fun/iptv.sh && bash iptv.sh
   cx # 打开 Xtream Codes 账号/频道 管理面板
 ```
 
-### 编译 h265 静态版本 FFmpeg
+### 编译 h265 patched 静态 FFmpeg
 
 ``` bash
   docker build -t ffmpeg-h265-static .

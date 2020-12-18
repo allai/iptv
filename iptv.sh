@@ -89,7 +89,7 @@
 
 set -euo pipefail
 
-sh_ver="1.41.0"
+sh_ver="1.50.0"
 sh_debug=0
 export LC_ALL=
 export LANG=en_US.UTF-8
@@ -221,7 +221,10 @@ JQ()
             "delete") 
                 if [ -n "${jq_path:-}" ] 
                 then
-                    if [ -z "${4:-}" ] 
+                    if [ -z "${3:-}" ] 
+                    then
+                        $JQ_FILE --argjson path "$jq_path" 'del(getpath($path))' "$FILE" > "$TMP_FILE" 2>> "$MONITOR_LOG"
+                    elif [ -z "${4:-}" ] 
                     then
                         $JQ_FILE --argjson path "$jq_path" --arg index "$3" 'del(getpath($path)[$index|tonumber])' "$FILE" > "$TMP_FILE" 2>> "$MONITOR_LOG"
                     else
@@ -243,6 +246,59 @@ JQ()
     } 200>"$FILE.lock"
 
     trap - EXIT
+}
+
+JQs()
+{
+    case $1 in
+        "merge")
+            read -r $2 < <($JQ_FILE -c -s '
+            def merge(a;b):
+                reduce b[] as $item (a;
+                reduce ($item | keys_unsorted[]) as $key (.;
+                $item[$key] as $val | ($val | type) as $type | .[$key] = if ($type == "object") then
+                    merge({}; [if .[$key] == null then {} else .[$key] end, $val])
+                elif ($type == "array") then
+                    (.[$key] + $val | unique)
+                else
+                    $val
+                end)
+                );
+            merge({}; .)' <<< "${!2} $3")
+        ;;
+        "flat")
+            $JQ_FILE -r -s '
+            def flat(a):
+                reduce a[] as $item ({};
+                reduce ($item | keys_unsorted[]) as $key (.;
+                $item[$key] as $val | ($val | type) as $type | .[$key] = if ($type == "object") then
+                    flat([$val])
+                elif ($type == "array") then
+                    reduce $val[] as $b (null;
+                        if (($b | type) == "object") then
+                            reduce ($b | keys_unsorted[]) as $key2 (.;
+                                $b[$key2] as $val2 | ($val2 | type) as $type2 | .[$key2] = .[$key2] + 
+                                if ($type2 == "object") then
+                                    flat([$val2])
+                                elif ($type2 == "array") then
+                                    reduce $val2[] as $c (null;
+                                        . + ($c | tostring) + "|"
+                                    ) + "^"
+                                else
+                                    ($val2 | tostring) + "^"
+                                end
+                            )
+                        else
+                            . + ($b | tostring) + "|"
+                        end
+                    )
+                else
+                    ($val | tostring)
+                end)
+                );
+            flat(.)|'"$3"'' "$2"
+        ;;
+    esac
 }
 
 SyncFile()
@@ -1631,9 +1687,9 @@ InstallPython()
         yum install -y gcc openssl-devel bzip2-devel libffi-devel >/dev/null 2>&1
         echo -n "...50%..."
         cd ~
-        wget --timeout=10 --tries=3 --no-check-certificate https://npm.taobao.org/mirrors/python/3.8.6/Python-3.8.6.tgz -qO Python-3.8.6.tgz
-        tar xzf Python-3.8.6.tgz
-        cd Python-3.8.6
+        wget --timeout=10 --tries=3 --no-check-certificate https://npm.taobao.org/mirrors/python/3.8.7/Python-3.8.7.tgz -qO Python-3.8.7.tgz
+        tar xzf Python-3.8.7.tgz
+        cd Python-3.8.7
         ./configure >/dev/null 2>&1
         make >/dev/null 2>&1
         make install >/dev/null 2>&1
@@ -2925,7 +2981,7 @@ FilterString()
 {
     for var in "${@}"
     do
-        read -r ${var?} <<< "${!var//^/-}"
+        read -r ${var?} <<< "${!var//[\^\`]/-}"
     done
 }
 
@@ -2987,7 +3043,8 @@ RandSegDirName()
 # printf %s "$1" | jq -s -R -r @uri
 Urlencode() {
     local LC_ALL='' LANG=C i c e=''
-    for ((i=0;i<${#1};i++)); do
+    for ((i=0;i<${#1};i++))
+    do
         c=${1:$i:1}
         [[ $c =~ [a-zA-Z0-9\.\~\_\-] ]] || printf -v c '%%%02x' "'$c"
         e+="$c"
@@ -2997,7 +3054,8 @@ Urlencode() {
 
 UrlencodeUpper() {
     local LC_ALL='' LANG=C i c e=''
-    for ((i=0;i<${#1};i++)); do
+    for ((i=0;i<${#1};i++))
+    do
         c=${1:$i:1}
         [[ $c =~ [a-zA-Z0-9\.\~\_\-] ]] || printf -v c '%%%02X' "'$c"
         e+="$c"
@@ -4885,102 +4943,88 @@ GetChannelsInfo()
 {
     [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
 
-    chnls_stream_link=()
-
-    IFS=$'\t' read -r chnls_count m_pid m_status m_stream_link m_live m_proxy m_xc_proxy m_user_agent m_headers m_cookies \
+    IFS=$'`\t' read -r m_pid m_status m_stream_link m_live m_proxy m_xc_proxy m_user_agent m_headers m_cookies \
     m_output_dir_name m_playlist_name m_seg_dir_name m_seg_name m_seg_length m_seg_count \
     m_video_codec m_audio_codec m_video_audio_shift m_txt_format m_draw_text m_quality m_bitrates m_const m_encrypt \
     m_encrypt_session m_keyinfo_name m_key_name m_key_time m_input_flags m_output_flags \
     m_channel_name m_channel_time m_sync m_sync_file m_sync_index m_sync_pairs m_flv_status \
-    m_flv_h265 m_flv_push_link m_flv_pull_link < <($JQ_FILE -r -M '[(.channels|length),([.channels[].pid]|join("^")),([.channels[].status]|join("^")),
-    ([.channels[].stream_link]|join("^")),([.channels[].live|if .=="" // .==null then "yes" else . end]|join("^")),([.channels[].proxy]|join("^")),
-    ([.channels[].xc_proxy]|join("^")),([.channels[].user_agent|if .==null then "Mozilla/5.0 (QtEmbedded; U; Linux; C)" else . end]|join("^")),([.channels[].headers]|join("^")),
-    ([.channels[].cookies|if .==null then "stb_lang=en; timezone=Europe/Amsterdam" else . end]|join("^")),([.channels[].output_dir_name]|join("^")),([.channels[].playlist_name]|join("^")),
-    ([.channels[].seg_dir_name]|join("^")),([.channels[].seg_name]|join("^")),([.channels[].seg_length]|join("^")),
-    ([.channels[].seg_count]|join("^")),([.channels[].video_codec]|join("^")),([.channels[].audio_codec]|join("^")),
-    ([.channels[].video_audio_shift]|join("^")),([.channels[].txt_format]|join("^")),([.channels[].draw_text]|join("^")),([.channels[].quality]|join("^")),
-    ([.channels[].bitrates]|join("^")),([.channels[].const]|join("^")),([.channels[].encrypt|if .=="-e" then "yes" elif .=="" // .==null then "no" else . end]|join("^")),
-    ([.channels[].encrypt_session|if .=="" // .==null then "no" else . end]|join("^")),([.channels[].keyinfo_name]|join("^")),([.channels[].key_name]|join("^")),
-    ([.channels[].key_time|if .=="" // .==null then now|strflocaltime("%s")|tonumber else . end]|join("^")),([.channels[].input_flags]|join("^")),([.channels[].output_flags]|join("^")),
-    ([.channels[].channel_name]|join("^")),([.channels[].channel_time|if .=="" // .==null then now|strflocaltime("%s")|tonumber else . end]|join("^")),([.channels[].sync|if .=="" // .==null then "yes" else . end]|join("^")),
-    ([.channels[].sync_file]|join("^")),([.channels[].sync_index]|join("^")),([.channels[].sync_pairs]|join("^")),
-    ([.channels[].flv_status|if .==null then "off" else . end]|join("^")),([.channels[].flv_h265|if .==null then "no" else . end]|join("^")),([.channels[].flv_push_link]|join("^")),
-    ([.channels[].flv_pull_link]|join("^"))]|@tsv' "$CHANNELS_FILE")
+    m_flv_h265 m_flv_push_link m_flv_pull_link < <(JQs flat "$CHANNELS_FILE" '.channels|
+    [.pid,.status,.stream_link,(.live + "`"),(.proxy + "`"),(.xc_proxy + "`"),(.user_agent + "`"),
+    (.headers + "`"),(.cookies + "`"),.output_dir_name,.playlist_name,.seg_dir_name,.seg_name,
+    .seg_length,.seg_count,.video_codec,.audio_codec,(.video_audio_shift + "`"),(.txt_format + "`"),
+    (.draw_text + "`"),.quality,.bitrates,(.const + "`"),(.encrypt + "`"),(.encrypt_session + "`"),
+    (.keyinfo_name + "`"),(.key_name + "`"),(.key_time + "`"),.input_flags,.output_flags,
+    (.channel_name + "`"),(.channel_time + "`"),(.sync + "`"),(.sync_file + "`"),(.sync_index + "`"),
+    (.sync_pairs + "`"),(.flv_status + "`"),(.flv_h265 + "`"),(.flv_push_link + "`"),
+    (.flv_pull_link + "`")]|@tsv')
 
-    chnls_count=${chnls_count#\"}
-    m_flv_pull_link=${m_flv_pull_link%\"}
+    chnls_count=0
 
-    if [ "$chnls_count" -gt 0 ] 
+    if [ -n "$m_pid" ]
     then
-        if [ "$chnls_count" -eq 1 ] 
-        then
-            IFS="^" read -r m_pid m_status m_stream_link m_live m_proxy m_xc_proxy m_user_agent m_headers m_cookies \
-            m_output_dir_name m_playlist_name m_seg_dir_name m_seg_name m_seg_length m_seg_count \
-            m_video_codec m_audio_codec m_video_audio_shift m_txt_format m_draw_text m_quality m_bitrates m_const m_encrypt \
-            m_encrypt_session m_keyinfo_name m_key_name m_key_time m_input_flags m_output_flags \
-            m_channel_name m_channel_time m_sync m_sync_file m_sync_index m_sync_pairs m_flv_status \
-            m_flv_h265 m_flv_push_link m_flv_pull_link < <($JQ_FILE -r -M '.channels[0]|
-            [.pid,.status,.stream_link,(.live|if .=="" // .==null then "yes" else . end),.proxy,
-            .xc_proxy,(.user_agent|if .==null then "Mozilla/5.0 (QtEmbedded; U; Linux; C)" else . end),
-            (.headers,.cookies|if .==null then "stb_lang=en; timezone=Europe/Amsterdam" else . end),
-            .output_dir_name,.playlist_name,.seg_dir_name,.seg_name,.seg_length,.seg_count,.video_codec,
-            .audio_codec,.video_audio_shift,.txt_format,.draw_text,.quality,.bitrates,.const,
-            (.encrypt|if .=="-e" then "yes" elif .=="" // .==null then "no" else . end),
-            (.encrypt_session|if .=="" // .==null then "no" else . end),.keyinfo_name,.key_name,
-            (.key_time|if .=="" // .==null then now|strflocaltime("%s")|tonumber else . end),.input_flags,
-            .output_flags,.channel_name,(.channel_time|if .=="" // .==null then now|strflocaltime("%s")|tonumber else . end),
-            (.sync|if .=="" // .==null then "yes" else . end),.sync_file,.sync_index,.sync_pairs,
-            (.flv_status|if .==null then "off" else . end),(.flv_h265|if .==null then "no" else . end),
-            .flv_push_link,.flv_pull_link]|join("^")' "$CHANNELS_FILE")
-        fi
-
         IFS="^" read -ra chnls_pid <<< "$m_pid"
         IFS="^" read -ra chnls_status <<< "$m_status"
         IFS="^" read -ra chnls_stream_links <<< "$m_stream_link"
 
         chnls_stream_link=("${chnls_stream_links[@]}")
+        chnls_count=${#chnls_pid[@]}
+        if_null=""
+
         for((chnls_i=0;chnls_i<chnls_count;chnls_i++));
         do
             chnls_stream_link[chnls_i]=${chnls_stream_link[chnls_i]%% *}
+            if_null="$if_null^"
         done
 
-        IFS="^" read -ra chnls_live <<< "${m_live}^"
-        IFS="^" read -ra chnls_proxy <<< "${m_proxy}^"
-        IFS="^" read -ra chnls_xc_proxy <<< "${m_xc_proxy}^"
-        IFS="^" read -ra chnls_user_agent <<< "${m_user_agent}^"
-        IFS="^" read -ra chnls_headers <<< "${m_headers}^"
-        IFS="^" read -ra chnls_cookies <<< "${m_cookies}^"
-        IFS="^" read -ra chnls_output_dir_name <<< "${m_output_dir_name}^"
-        IFS="^" read -ra chnls_playlist_name <<< "${m_playlist_name}^"
-        IFS="^" read -ra chnls_seg_dir_name <<< "${m_seg_dir_name}^"
-        IFS="^" read -ra chnls_seg_name <<< "${m_seg_name}^"
-        IFS="^" read -ra chnls_seg_length <<< "${m_seg_length}^"
-        IFS="^" read -ra chnls_seg_count <<< "${m_seg_count}^"
-        IFS="^" read -ra chnls_video_codec <<< "${m_video_codec}^"
-        IFS="^" read -ra chnls_audio_codec <<< "${m_audio_codec}^"
-        IFS="^" read -ra chnls_video_audio_shift <<< "${m_video_audio_shift}^"
-        IFS="^" read -ra chnls_txt_format <<< "${m_txt_format}^"
-        IFS="^" read -ra chnls_draw_text <<< "${m_draw_text}^"
-        IFS="^" read -ra chnls_quality <<< "${m_quality}^"
-        IFS="^" read -ra chnls_bitrates <<< "${m_bitrates}^"
-        IFS="^" read -ra chnls_const <<< "${m_const}^"
-        IFS="^" read -ra chnls_encrypt <<< "${m_encrypt}^"
-        IFS="^" read -ra chnls_encrypt_session <<< "${m_encrypt_session}^"
-        IFS="^" read -ra chnls_keyinfo_name <<< "${m_keyinfo_name}^"
-        IFS="^" read -ra chnls_key_name <<< "${m_key_name}^"
-        IFS="^" read -ra chnls_key_time <<< "${m_key_time}^"
-        IFS="^" read -ra chnls_input_flags <<< "${m_input_flags}^"
-        IFS="^" read -ra chnls_output_flags <<< "${m_output_flags}^"
-        IFS="^" read -ra chnls_channel_name <<< "${m_channel_name}^"
-        IFS="^" read -ra chnls_channel_time <<< "${m_channel_time}^"
-        IFS="^" read -ra chnls_sync <<< "${m_sync}^"
-        IFS="^" read -ra chnls_sync_file <<< "${m_sync_file}^"
-        IFS="^" read -ra chnls_sync_index <<< "${m_sync_index}^"
-        IFS="^" read -ra chnls_sync_pairs <<< "${m_sync_pairs}^"
-        IFS="^" read -ra chnls_flv_status <<< "${m_flv_status}^"
-        IFS="^" read -ra chnls_flv_h265 <<< "${m_flv_h265}^"
-        IFS="^" read -ra chnls_flv_push_link <<< "${m_flv_push_link}^"
-        IFS="^" read -ra chnls_flv_pull_link <<< "${m_flv_pull_link}^"
+        IFS="^" read -ra chnls_live <<< "${m_live:-${if_null//^/yes^}}"
+        IFS="^" read -ra chnls_proxy <<< "${m_proxy:-$if_null}"
+        IFS="^" read -ra chnls_xc_proxy <<< "${m_xc_proxy:-$if_null}"
+        IFS="^" read -ra chnls_user_agent <<< "${m_user_agent:-${if_null//^/Mozilla/5.0 (QtEmbedded; U; Linux; C)^}}"
+        IFS="^" read -ra chnls_headers <<< "${m_headers:-$if_null}"
+        IFS="^" read -ra chnls_cookies <<< "${m_cookies:-${if_null//^/stb_lang=en; timezone=Europe/Amsterdam^}}"
+        IFS="^" read -ra chnls_output_dir_name <<< "$m_output_dir_name"
+        IFS="^" read -ra chnls_playlist_name <<< "$m_playlist_name"
+        IFS="^" read -ra chnls_seg_dir_name <<< "$m_seg_dir_name"
+        IFS="^" read -ra chnls_seg_name <<< "$m_seg_name"
+        IFS="^" read -ra chnls_seg_length <<< "$m_seg_length"
+        IFS="^" read -ra chnls_seg_count <<< "$m_seg_count"
+        IFS="^" read -ra chnls_video_codec <<< "$m_video_codec"
+        IFS="^" read -ra chnls_audio_codec <<< "$m_audio_codec"
+        IFS="^" read -ra chnls_video_audio_shift <<< "${m_video_audio_shift:-$if_null}"
+        IFS="^" read -ra chnls_txt_format <<< "${m_txt_format:-$if_null}"
+        IFS="^" read -ra chnls_draw_text <<< "${m_draw_text:-$if_null}"
+        IFS="^" read -ra chnls_quality <<< "$m_quality"
+        IFS="^" read -ra chnls_bitrates <<< "$m_bitrates"
+        IFS="^" read -ra chnls_const <<< "${m_const:-${if_null//^/no^}}"
+        m_encrypt=${m_encrypt:-${if_null//^/no^}}
+        m_encrypt=${m_encrypt//-e/yes}
+        IFS="^" read -ra chnls_encrypt <<< "${m_encrypt:-${if_null//^/no^}}"
+        IFS="^" read -ra chnls_encrypt_session <<< "${m_encrypt_session:-${if_null//^/no^}}"
+        IFS="^" read -ra chnls_keyinfo_name <<< "${m_keyinfo_name:-${if_null//^/keyinfo^}}"
+        IFS="^" read -ra chnls_key_name <<< "${m_key_name:-${if_null//^/keyname^}}"
+        if [ -z "$m_key_time" ] 
+        then
+            printf -v now '%(%s)T' -1
+            m_key_time=${if_null//^/${now}^}
+        fi
+        IFS="^" read -ra chnls_key_time <<< "$m_key_time"
+        IFS="^" read -ra chnls_input_flags <<< "$m_input_flags"
+        IFS="^" read -ra chnls_output_flags <<< "$m_output_flags"
+        IFS="^" read -ra chnls_channel_name <<< "${m_channel_name:-${if_null//^/channel_name^}}"
+        if [ -z "$m_channel_time" ] 
+        then
+            printf -v now '%(%s)T' -1
+            m_channel_time=${if_null//^/${now}^}
+        fi
+        IFS="^" read -ra chnls_channel_time <<< "$m_channel_time"
+        IFS="^" read -ra chnls_sync <<< "${m_sync:-${if_null//^/yes^}}"
+        IFS="^" read -ra chnls_sync_file <<< "${m_sync_file:-$if_null}"
+        IFS="^" read -ra chnls_sync_index <<< "${m_sync_index:-$if_null}"
+        IFS="^" read -ra chnls_sync_pairs <<< "${m_sync_pairs:-$if_null}"
+        IFS="^" read -ra chnls_flv_status <<< "${m_flv_status:-${if_null//^/off^}}"
+        IFS="^" read -ra chnls_flv_h265 <<< "${m_flv_h265:-${if_null//^/no^}}"
+        IFS="^" read -ra chnls_flv_push_link <<< "${m_flv_push_link:-$if_null}"
+        IFS="^" read -ra chnls_flv_pull_link <<< "${m_flv_pull_link:-$if_null}"
     fi
 }
 
@@ -4992,7 +5036,8 @@ ListChannels()
         Println "$error 没有发现频道, 请检查 !\n" && exit 1
     fi
     chnls_list=""
-    for((index = 0; index < chnls_count; index++)); do
+    for((index=0;index<chnls_count;index++))
+    do
         chnls_output_dir_root="$LIVE_ROOT/${chnls_output_dir_name[index]}"
 
         v_or_a=${chnls_video_audio_shift[index]%_*}
@@ -5072,7 +5117,7 @@ ListChannels()
             else
                 chnls_status_text=$red"关闭"${normal}
             fi
-            chnls_list=$chnls_list"# $green$((index+1))${normal}\r\033[6C进程ID: $green${chnls_pid[index]}${normal} 状态: $chnls_status_text 频道名称: $green${chnls_channel_name[index]} $chnls_proxy_text${normal}\n\r\033[6C编码: $green${chnls_video_codec[index]}:${chnls_audio_codec[index]}${normal} 延迟: $green$chnls_video_audio_shift_text${normal} 视频质量: $green$chnls_video_quality_text${normal}\n\r\033[6C源: ${chnls_stream_link[index]}\n\r\033[6Cm3u8位置: $chnls_playlist_file_text\n\n"
+            chnls_list=$chnls_list"# $green$((index+1))${normal}\r\033[6C进程ID: $green${chnls_pid[index]}${normal} 状态: $chnls_status_text 频道名称: $green${chnls_channel_name[index]} $chnls_proxy_text${normal}\n\033[6C编码: $green${chnls_video_codec[index]}:${chnls_audio_codec[index]}${normal} 延迟: $green$chnls_video_audio_shift_text${normal} 视频质量: $green$chnls_video_quality_text${normal}\n\033[6C源: ${chnls_stream_link[index]}\n\033[6Cm3u8位置: $chnls_playlist_file_text\n\n"
         elif [ "$kind" == "flv" ] 
         then
             if [ "${chnls_flv_status[index]}" == "on" ] 
@@ -5081,7 +5126,7 @@ ListChannels()
             else
                 chnls_flv_status_text=$red"关闭"${normal}
             fi
-            chnls_list=$chnls_list"# $green$((index+1))${normal}\r\033[6C进程ID: $green${chnls_pid[index]}${normal} 状态: $chnls_flv_status_text 频道名称: $green${chnls_channel_name[index]} $chnls_proxy_text${normal}\n\r\033[6C编码: $green${chnls_video_codec[index]}:${chnls_audio_codec[index]}${normal} 延迟: $green$chnls_video_audio_shift_text${normal} 视频质量: $green$chnls_video_quality_text${normal}\n\r\033[6Cflv推流地址: ${chnls_flv_push_link[index]:-无}\n\r\033[6Cflv拉流地址: ${chnls_flv_pull_link[index]:-无}\n\n"
+            chnls_list=$chnls_list"# $green$((index+1))${normal}\r\033[6C进程ID: $green${chnls_pid[index]}${normal} 状态: $chnls_flv_status_text 频道名称: $green${chnls_channel_name[index]} $chnls_proxy_text${normal}\n\033[6C编码: $green${chnls_video_codec[index]}:${chnls_audio_codec[index]}${normal} 延迟: $green$chnls_video_audio_shift_text${normal} 视频质量: $green$chnls_video_quality_text${normal}\n\033[6Cflv推流地址: ${chnls_flv_push_link[index]:-无}\n\033[6Cflv拉流地址: ${chnls_flv_pull_link[index]:-无}\n\n"
         fi
     done
 
@@ -6449,7 +6494,7 @@ SetVideoAudioShift()
                 break
             ;;
             "设置 画面延迟") 
-                Println "请输入延迟时间（比如 0.5）"
+                Println "请输入延迟时间(比如 0.5)"
                 read -p "(默认: 返回上级选项): " video_shift
                 if [ -n "$video_shift" ] 
                 then
@@ -6459,7 +6504,7 @@ SetVideoAudioShift()
                 fi
             ;;
             "设置 声音延迟") 
-                Println "请输入延迟时间（比如 0.5）"
+                Println "请输入延迟时间(比如 0.5)"
                 read -p "(默认: 返回上级选项): " audio_shift
                 if [ -n "$audio_shift" ] 
                 then
@@ -7544,6 +7589,7 @@ AddChannel()
             if [ -n "$stream_links_list" ] 
             then
                 stream_link_root=${stream_link%%|*}
+                stream_link_base=${stream_link%/*}
                 choose=1
 
                 if [[ $stream_link =~ \|([^|]+)$ ]] 
@@ -7564,7 +7610,12 @@ AddChannel()
                                 found=1
                                 stream_link_qualities[i]="${stream_links_bitrate[j]}-${stream_links_resolution[j]}"
                                 [ -n "$stream_link" ] && stream_link="$stream_link "
-                                stream_link="$stream_link${stream_links_url%/*}/${stream_links_uri[j]}"
+                                if [[ ${stream_links_uri[j]} =~ ^https?:// ]] 
+                                then
+                                    stream_link="$stream_link${stream_links_uri[j]}"
+                                else
+                                    stream_link="$stream_link$stream_link_base/${stream_links_uri[j]}"
+                                fi
                                 break
                             fi
                         done
@@ -7595,11 +7646,11 @@ AddChannel()
                     then
                         stream_links_select_all=$((stream_links_count+1))
                         stream_links_list="$stream_links_list $green$stream_links_select_all.${normal}\r\033[6C全部"
-                        Println "$stream_links_list"
+                        Println "$stream_links_list\n"
                         echo "选择分辨率 (多个分辨率用空格分隔 比如: 1 2 4-5)"
                     else
                         stream_links_select_all=""
-                        Println "$stream_links_list"
+                        Println "$stream_links_list\n"
                         echo "选择分辨率"
                     fi
 
@@ -7616,7 +7667,12 @@ AddChannel()
                                 [ -n "$stream_link_quality" ] && stream_link_quality="$stream_link_quality,"
                                 stream_link_quality="$stream_link_quality${stream_links_bitrate[i]}-${stream_links_resolution[i]}"
                                 [ -n "$stream_link" ] && stream_link="$stream_link "
-                                stream_link="$stream_link${stream_links_url%/*}/${stream_links_uri[i]}"
+                                if [[ ${stream_links_uri[i]} =~ ^https?:// ]] 
+                                then
+                                    stream_link="$stream_link${stream_links_uri[i]}"
+                                else
+                                    stream_link="$stream_link$stream_link_base/${stream_links_uri[i]}"
+                                fi
                             done
                             break
                         fi
@@ -7669,14 +7725,24 @@ AddChannel()
                                             [ -n "$stream_link_quality" ] && stream_link_quality="$stream_link_quality,"
                                             stream_link_quality="$stream_link_quality${stream_links_bitrate[i]}-${stream_links_resolution[i]}"
                                             [ -n "$stream_link" ] && stream_link="$stream_link "
-                                            stream_link="$stream_link${stream_links_url%/*}/${stream_links_uri[i]}"
+                                            if [[ ${stream_links_uri[i]} =~ ^https?:// ]] 
+                                            then
+                                                stream_link="$stream_link${stream_links_uri[i]}"
+                                            else
+                                                stream_link="$stream_link$stream_link_base/${stream_links_uri[i]}"
+                                            fi
                                         done
                                     else
                                         stream_links_index=$((stream_link_num-1))
                                         [ -n "$stream_link_quality" ] && stream_link_quality="$stream_link_quality,"
                                         stream_link_quality="$stream_link_quality${stream_links_bitrate[stream_links_index]}-${stream_links_resolution[stream_links_index]}"
                                         [ -n "$stream_link" ] && stream_link="$stream_link "
-                                        stream_link="$stream_link${stream_links_url%/*}/${stream_links_uri[stream_links_index]}"
+                                        if [[ ${stream_links_uri[stream_links_index]} =~ ^https?:// ]] 
+                                        then
+                                            stream_link="$stream_link${stream_links_uri[stream_links_index]}"
+                                        else
+                                            stream_link="$stream_link$stream_link_base/${stream_links_uri[stream_links_index]}"
+                                        fi
                                     fi
                                 done
                                 break
@@ -12222,15 +12288,64 @@ ScheduleTvbhd()
 
 ScheduleSingteltv()
 {
-    printf -v today '%(%Y%m%d)T' -1
+    if [ "${singteltv_status:-1}" -eq 2 ] 
+    then
+        return 0
+    fi
 
     if [ ! -s "$SCHEDULE_JSON" ] 
     then
         printf '{"%s":[]}' "my_tvbjade" > "$SCHEDULE_JSON"
     fi
 
-    schedule_today=$(curl -s -Lm 10 -H "User-Agent: $user_agent" "http://singteltv.com.sg/epg/channel$today.html")
-    schedule_today=${schedule_today//$'\n'/}
+    if [ "${singteltv_status:-0}" -eq 0 ] 
+    then
+        Println "$info 解析 singteltv ..."
+        singteltv_status=0
+        while IFS= read -r line 
+        do
+            if [[ $line =~ epgEndPoint ]] 
+            then
+                line=${line#*epgEndPoint&#34;:&#34;}
+                singteltv_epg_end_point=${line%%&#34*}
+                line=${line#*tvChannelLists&#34;:}
+                singteltv_tv_channel_lists=${line%%,&#34;errorMessage*}
+                singteltv_tv_channel_lists=${singteltv_tv_channel_lists//&#34;/\"}
+                singteltv_status=1
+                break
+            fi
+        done < <(curl -s -L "https://www.singtel.com/personal/products-services/tv/tv-programme-guide" 2> /dev/null)
+    fi
+
+    if [ "$singteltv_status" -eq 0 ] 
+    then
+        Println "$error 无法连接 singteltv ?"
+        singteltv_status=2
+        return 0
+    fi
+
+    printf -v today '%(%d%m%Y)T' -1
+    epg_data=$(curl -s -L "https://www.singtel.com$singteltv_epg_end_point/$today.json")
+
+    IFS=$'\t' read -r title channel_id epg_channel_id < <($JQ_FILE -r '[
+        ([.[]|.title|. + "^"]|join("")),
+        ([.[]|.channelId|. + "^"]|join("")),
+        ([.[]|.epgChannelId|. + "^"]|join(""))
+    ]|@@tsv' <<< "$singteltv_tv_channel_lists")
+
+    IFS="^" read -r -a titles <<< "$title"
+    IFS="^" read -r -a channel_ids <<< "$channel_id"
+    IFS="^" read -r -a epg_channel_ids <<< "$epg_channel_id"
+
+    IFS=$'\t' read -r schedule_id schedule_title schedule_time < <($JQ_FILE -r '[
+        ([to_entries[]|.key|tostring|. + "^"]|join("")),
+        ([to_entries[]|([.value[].program.title|. + "|"]|join(""))|. + "^"]|join("")),
+        ([to_entries[]|([.value[].startDateTime|. + "|"]|join(""))|. + "^"]|join(""))
+    ]|@tsv' <<< "$epg_data")
+
+    IFS="^" read -r -a schedule_ids <<< "$schedule_id"
+    IFS="^" read -r -a schedule_titles <<< "$schedule_title"
+    IFS="^" read -r -a schedule_times <<< "$schedule_time"
 
     for chnl in "${singteltv_chnls[@]}"
     do
@@ -12240,23 +12355,33 @@ ScheduleSingteltv()
         singteltv_id=${singteltv_id%%:*}
 
         schedule=""
-
-        line=$(grep -o -P '(?<=ch-'"$singteltv_id"'").*?(?=</ul>)' <<< "$schedule_today")
-        while [[ $line == *"li-time"* ]] 
+        for((singteltv_i=0;singteltv_i<${#channel_ids[@]};singteltv_i++));
         do
-            line=${line#*<span class=\"li-time\">}
-            program_time=${line%%<\/span>*}
-            line=${line#*<span class=\"li-title\">}
-            program_title=${line%%<\/span>*}
-            program_title=${program_title%% / *}
-            program_title=${program_title//\"/\\\"}
-            program_sys_time=$(date -d "$today $program_time" +%s)
-            [ -n "$schedule" ] && schedule="$schedule,"
-            schedule=$schedule'{
-                "title":"'"$program_title"'",
-                "time":"'"$program_time"'",
-                "sys_time":"'"$program_sys_time"'"
-            }'
+            if [ "${channel_ids[singteltv_i]}" == "$singteltv_id" ] 
+            then
+                for((schedule_i=0;schedule_i<${#schedule_ids[@]};schedule_i++));
+                do
+                    if [ "${schedule_ids[schedule_i]}" == "${epg_channel_ids[singteltv_i]}" ] 
+                    then
+                        IFS="|" read -r -a program_titles <<< "${schedule_titles[schedule_i]}"
+                        IFS="|" read -r -a program_times <<< "${schedule_times[schedule_i]}"
+                        for((program_i=0;program_i<${#program_titles[@]};program_i++));
+                        do
+                            program_time=${program_times[program_i]#*T}
+                            program_time=${program_time%:*}
+                            program_sys_time=$(date -d "${program_times[program_i]}" +%s)
+                            [ -n "$schedule" ] && schedule="$schedule,"
+                            schedule=$schedule'{
+                                "title":"'"${program_titles[program_i]}"'",
+                                "time":"'"$program_time"'",
+                                "sys_time":"'"$program_sys_time"'"
+                            }'
+                        done
+                        break
+                    fi
+                done
+                break
+            fi
         done
 
         if [ -n "$schedule" ] 
@@ -16510,7 +16635,7 @@ MonitorSet()
         for((i=0;i<flv_count;i++));
         do
             flv_pull_link=${monitor_flv_pull_links[i]}
-            result=$result"  $green$((i+1)).${normal}\r\033[6C${monitor_channel_names[i]}\n\r\033[6C源: ${monitor_stream_links[i]}\n\r\033[6Cpull: ${flv_pull_link:-无}\n\n"
+            result=$result"  $green$((i+1)).${normal}\r\033[6C${monitor_channel_names[i]}\n\033[6C源: ${monitor_stream_links[i]}\n\033[6Cpull: ${flv_pull_link:-无}\n\n"
         done
 
         Println "$result"
@@ -19059,7 +19184,7 @@ DomainInstallCert()
         else
             apt-get -y install socat > /dev/null
         fi
-        bash <(curl -s -m 10 https://get.acme.sh) > /dev/null
+        bash <(curl -s -m 20 https://get.acme.sh) > /dev/null
     fi
 
     $NGINX_FILE -s stop 2> /dev/null || true
@@ -19226,7 +19351,7 @@ InstallOpenresty()
         --with-http_auth_request_module --with-http_secure_link_module \
         --with-http_random_index_module --with-http_gzip_static_module \
         --with-http_sub_module --with-http_dav_module --with-http_flv_module \
-        --with-http_mp4_module --with-http_gunzip_module --with-threads >/dev/null 2>&1
+        --with-http_mp4_module --with-http_gunzip_module --with-stream --with-stream_ssl_preread_module --with-threads >/dev/null 2>&1
 
     echo -n "...80%..."
 
@@ -19325,7 +19450,8 @@ InstallNginx()
         --with-pcre=../pcre-8.44 --with-pcre-jit --with-zlib=../zlib-1.2.11 \
         --with-openssl=../$openssl_name --with-openssl-opt=no-nextprotoneg \
         --with-http_stub_status_module --with-http_ssl_module --with-http_v2_module \
-        --with-http_realip_module --with-threads --with-debug >/dev/null 2>&1
+        --with-http_realip_module --with-threads --with-stream --with-stream_ssl_preread_module \
+        --with-debug >/dev/null 2>&1
 
     echo -n "...80%..."
 
@@ -21929,11 +22055,10 @@ V2rayConfigInstall()
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": {}
+      "tag": "direct"
     },
     {
-      "protocol": "blackhole",
-      "settings": {},
+      "protocol": "blackhole"
       "tag": "blocked"
     }
   ],
@@ -21944,11 +22069,11 @@ V2rayConfigInstall()
         "ip": [
           "geoip:private"
         ],
-        "outboundTag": "blocked"
+        "outboundTag": "direct"
       }
     ]
   },
-  "PolicyObject": {
+  "policy": {
     "levels": {
       "0": {
         "handshake": 4,
@@ -21973,7 +22098,7 @@ V2rayConfigUpdate()
     then
         Println "$error v2ray 未安装...\n" && exit 1
     fi
-    if ! grep -q '"tag": "nginx-1"' < "$V2_CONFIG" && ! grep -q '"tag": "no-nginx-1"' < "$V2_CONFIG"
+    if ! $JQ_FILE '.' "$V2_CONFIG" > /dev/null 2>&1
     then
         if grep -q '"path": "' < "$V2_CONFIG" 
         then
@@ -21992,274 +22117,6 @@ V2rayConfigUpdate()
     fi
 }
 
-V2rayGetInbounds()
-{
-    inbounds_count=0
-    inbounds_nginx_count=0
-    inbounds_nginx_index=()
-    inbounds_forward_count=0
-    inbounds_listen=()
-    inbounds_port=()
-    inbounds_protocol=()
-    inbounds_network=()
-    inbounds_path=()
-    inbounds_tag=()
-    inbounds_timeout=()
-    inbounds_allow_transparent=()
-    inbounds_user_level=()
-
-    while IFS="^" read -r map_listen map_port map_protocol map_network map_path map_tag map_timeout map_allow_transparent map_user_level
-    do
-        if [ "${map_tag:0:6}" == "nginx-" ] || [ "${map_tag:0:9}" == "no-nginx-" ]
-        then
-            inbounds_nginx_count=$((inbounds_nginx_count+1))
-            inbounds_nginx_index+=("$inbounds_count")
-        else
-            inbounds_forward_count=$((inbounds_forward_count+1))
-        fi
-
-        inbounds_listen+=("$map_listen")
-        inbounds_port+=("$map_port")
-        inbounds_protocol+=("$map_protocol")
-        inbounds_network+=("$map_network")
-        inbounds_path+=("$map_path")
-        inbounds_tag+=("$map_tag")
-        inbounds_timeout+=("$map_timeout")
-        inbounds_allow_transparent+=("$map_allow_transparent")
-        inbounds_user_level+=("$map_user_level")
-        inbounds_count=$((inbounds_count+1))
-    done < <($JQ_FILE -r '.inbounds[]|[.listen,.port,.protocol,.streamSettings.network,.streamSettings.wsSettings.path,.tag,.settings.timeout,.settings.allowTransparent,.settings.userLevel]|join("^")' "$V2_CONFIG")
-    return 0
-}
-
-V2rayGetOutbounds()
-{
-    outbounds_count=0
-    outbounds_index=0
-    outbounds_vmess_count=0
-    outbounds_http_count=0
-    outbounds_https_count=0
-    outbounds_protocol=()
-    outbounds_tag=()
-    outbounds_security=()
-    outbounds_allow_insecure=()
-    outbounds_proxy_settings_tag=()
-
-    while IFS="^" read -r map_protocol map_tag map_proxy_settings_tag map_security map_allow_insecure
-    do
-        map_protocol=${map_protocol#\"}
-        map_allow_insecure=${map_allow_insecure%\"}
-
-        if [ -n "$map_tag" ] 
-        then
-            if [ -n "$map_proxy_settings_tag" ] 
-            then
-                outbounds_proxy_settings_tag+=("$map_proxy_settings_tag")
-            else
-                outbounds_proxy_settings_tag+=("")
-            fi
-            if [ "$map_tag" != "blocked" ] 
-            then
-                outbounds_count=$((outbounds_count+1))
-                if [ "$map_protocol" == "vmess" ] 
-                then
-                    outbounds_vmess_count=$((outbounds_vmess_count+1))
-                elif [ "$map_protocol" == "http" ] 
-                then
-                    if [ -n "$map_security" ] 
-                    then
-                        outbounds_https_count=$((outbounds_https_count+1))
-                    else
-                        outbounds_http_count=$((outbounds_http_count+1))
-                    fi
-                fi
-                outbounds_protocol+=("$map_protocol")
-                outbounds_tag+=("$map_tag")
-                outbounds_security+=("$map_security")
-                outbounds_allow_insecure+=("$map_allow_insecure")
-            fi
-        fi
-
-        outbounds_index=$((outbounds_index+1))
-
-    done < <($JQ_FILE '.outbounds[] | [.protocol,.tag,.proxySettings.tag,.streamSettings.security,.streamSettings.tlsSettings.allowInsecure] | join("^")' "$V2_CONFIG")
-
-    outbounds_proxy_forward=()
-    for((i=0;i<${#outbounds_tag[@]};i++));
-    do
-        found=0
-        for((j=0;j<${#outbounds_proxy_settings_tag[@]};j++));
-        do
-            if [ "${outbounds_proxy_settings_tag[j]}" == "${outbounds_tag[i]}" ] 
-            then
-                found=1
-                outbounds_proxy_forward+=("true")
-                break
-            fi
-        done
-
-        if [ "$found" -eq 0 ] 
-        then
-            outbounds_proxy_forward+=("false")
-        fi
-    done
-}
-
-V2rayGetRules()
-{
-    rules_outbound_tag=()
-    while IFS="^" read -r outbound_tag 
-    do
-        rules_outbound_tag+=("$outbound_tag")
-    done < <($JQ_FILE -r '.routing.rules[] | [.outboundTag] | join("^")' "$V2_CONFIG")
-    rules_count=${#rules_outbound_tag[@]}
-}
-
-V2rayGetLevels()
-{
-    levels_id=()
-    levels_handshake=()
-    levels_connIdle=()
-    levels_uplinkOnly=()
-    levels_downlinkOnly=()
-    levels_statsUserUplink=()
-    levels_statsUserDownlink=()
-    levels_bufferSize=()
-    while IFS="=" read -r map_id map_handshake map_connIdle map_uplinkOnly map_downlinkOnly map_statsUserUplink map_statsUserDownlink map_bufferSize
-    do
-        levels_id+=("$map_id")
-        levels_handshake+=("$map_handshake")
-        levels_connIdle+=("$map_connIdle")
-        levels_uplinkOnly+=("$map_uplinkOnly")
-        levels_downlinkOnly+=("$map_downlinkOnly")
-        levels_statsUserUplink+=("$map_statsUserUplink")
-        levels_statsUserDownlink+=("$map_statsUserDownlink")
-        levels_bufferSize+=("$map_bufferSize")
-    done < <($JQ_FILE -r '.PolicyObject.levels | to_entries | map([.key,.value.handshake,.value.connIdle,.value.uplinkOnly,.value.downlinkOnly,.value.statsUserUplink,.value.statsUserDownlink,.value.bufferSize] | join("="))[]' "$V2_CONFIG")
-    levels_count=${#levels_id[@]}
-}
-
-V2rayListForward()
-{
-    V2rayGetInbounds
-    V2rayGetOutbounds
-
-    echo && Println "=== 入站转发账号组数 $green $inbounds_forward_count ${normal}\n"
-
-    inbounds_forward_list=""
-    index=0
-    for((i=0;i<inbounds_count;i++));
-    do
-        if [[ ${inbounds_tag[i]} == "nginx-"* ]] || [ "${map_tag:0:9}" == "no-nginx-" ]
-        then
-            continue
-        fi
-
-        index=$((index+1))
-
-        if [ -n "${inbounds_network[i]}" ] 
-        then
-            stream_settings_list="\n\r\033[6C网络: $green${inbounds_network[i]}${normal} 路径: $green${inbounds_path[i]}${normal} 加密: $green否${normal}"
-        else
-            stream_settings_list=""
-        fi
-
-        if [ -n "${inbounds_timeout[i]}" ] 
-        then
-            http_list="\n\r\033[6C超时: $green${inbounds_timeout[i]}${normal} 转发所有请求: $green${inbounds_allow_transparent[i]}${normal} 等级: $green${inbounds_user_level[i]}${normal}"
-        else
-            http_list=""
-        fi
-
-        inbounds_forward_list=$inbounds_forward_list"# $green$index${normal}\r\033[6C组名: $green${inbounds_tag[i]}${normal} 协议: $green${inbounds_protocol[i]}${normal} 地址: $green${inbounds_listen[i]}:${inbounds_port[i]}${normal}$stream_settings_list$http_list\n\n"
-    done
-    [ -n "$inbounds_forward_list" ] && echo -e "$inbounds_forward_list\n"
-
-    Println "=== 出站转发账号组数 $green $outbounds_count ${normal}\n"
-
-    outbounds_list=""
-    for((i=0;i<outbounds_count;i++));
-    do
-        if [ -n "${outbounds_security[i]}" ] 
-        then
-            protocol="https"
-            stream_settings_list="\n\r\033[6Csecurity: $green${outbounds_security[i]}${normal} 检测证书有效性: $green${outbounds_allow_insecure[i]}${normal}"
-        else
-            protocol=${outbounds_protocol[i]}
-            stream_settings_list=""
-        fi
-
-        if [ -n "${outbounds_proxy_settings_tag[i]}" ] 
-        then
-            proxy_list="\n\r\033[6C前置代理: $green终${normal}"
-        elif [ "${outbounds_proxy_forward[i]}" == "true" ] 
-        then
-            proxy_list="\n\r\033[6C前置代理: $green始${normal}"
-        else
-            proxy_list=""
-        fi
-
-        outbounds_list=$outbounds_list"# $green$((i+inbounds_forward_count+1))${normal}\r\033[6C组名: $green${outbounds_tag[i]}${normal} 协议: $green$protocol${normal}$stream_settings_list$proxy_list\n\n"
-    done
-    [ -n "$outbounds_list" ] && echo -e "$outbounds_list\n"
-    return 0
-}
-
-V2rayListNginx()
-{
-    V2rayGetInbounds
-
-    [ "$inbounds_nginx_count" -eq 0 ] && Println "$error 没有账号组\n" && exit 1
-
-    Println "\n=== 账号组数 $green $inbounds_nginx_count ${normal}  nginx-$green ($nginx_name 连接) ${normal}, no-nginx-$green (公开连接) ${normal}"
-
-    nginx_list=""
-
-    for((i=0;i<inbounds_nginx_count;i++));
-    do
-        inbounds_index=${inbounds_nginx_index[i]}
-        if [ -n "${inbounds_network[inbounds_index]}" ] 
-        then
-            stream_settings_list="\n\r\033[6C网络: $green${inbounds_network[inbounds_index]}${normal} 路径: $green${inbounds_path[inbounds_index]}${normal} 加密: $green否${normal}"
-        else
-            stream_settings_list=""
-        fi
-        nginx_list=$nginx_list"# $green$((i+1))${normal}\r\033[6C组名: $green${inbounds_tag[inbounds_index]}${normal} 协议: $green${inbounds_protocol[inbounds_index]}${normal} 地址: $green${inbounds_listen[inbounds_index]}:${inbounds_port[inbounds_index]}${normal}$stream_settings_list\n\n"
-    done
-
-    Println "$nginx_list\n"
-}
-
-V2rayDeleteNginx()
-{
-    echo "输入序号"
-    while read -p "(默认: 取消): " nginx_num
-    do
-        case "$nginx_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$nginx_num" -gt 0 ] && [ "$nginx_num" -le $inbounds_nginx_count ]
-                then
-                    nginx_num=$((nginx_num-1))
-                    nginx_index=${inbounds_nginx_index[nginx_num]}
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
-
-    jq_path='["inbounds"]'
-    JQ delete "$V2_CONFIG" "$nginx_index"
-    Println "$info 账号组删除成功\n"
-}
-
 V2rayStatus()
 {
     if [[ $(systemctl is-active v2ray) == "active" ]]
@@ -22270,275 +22127,49 @@ V2rayStatus()
     fi
 }
 
-V2rayListNginxAccounts()
-{
-    echo "输入序号"
-    while read -p "(默认: 取消): " nginx_num
-    do
-        case "$nginx_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$nginx_num" -gt 0 ] && [ "$nginx_num" -le $inbounds_nginx_count ]
-                then
-                    nginx_num=$((nginx_num-1))
-                    nginx_index=${inbounds_nginx_index[nginx_num]}
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
-
-    accounts_count=0
-    accounts_list=""
-    while IFS="=" read -r map_id map_level map_alter_id map_email
-    do
-        accounts_count=$((accounts_count+1))
-        accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6CID: $green$map_id${normal} 等级: $green$map_level${normal} alterId: $green$map_alter_id${normal} 邮箱: $green$map_email${normal}\n\n"
-    done < <($JQ_FILE -r '.inbounds['"$nginx_index"'].settings.clients[] | [.id,.level,.alterId,.email] | join("=")' "$V2_CONFIG")
-
-    V2rayListDomainsInbound
-
-    if [ -n "$accounts_list" ] 
-    then
-        echo "可用账号:"
-        Println "$accounts_list\n"
-    else
-        Println "此账号组没有账号\n"
-    fi
-}
-
-V2raySetNginxTag()
-{
-    i=0
-    while true 
-    do
-        i=$((i+1))
-        tag="nginx-$i"
-        if ! grep -q '"tag": "'"$tag"'"' < "$V2_CONFIG"
-        then
-            break
-        fi
-    done
-    Println "  组名: $green $tag ${normal}\n"
-}
-
-V2raySetNoNginxTag()
-{
-    i=0
-    while true 
-    do
-        i=$((i+1))
-        tag="no-nginx-$i"
-        if ! grep -q '"tag": "'"$tag"'"' < "$V2_CONFIG"
-        then
-            break
-        fi
-    done
-    Println "  组名: $green $tag ${normal}\n"
-}
-
-V2rayAddNginx()
-{
-    echo
-    yn_options=( '是' '否' )
-    inquirer list_input "是否通过 nginx 连接" yn_options nginx_proxy_yn
-    if [[ $nginx_proxy_yn == "是" ]]
-    then
-        listen="127.0.0.1"
-        V2raySetNginxTag
-    else
-        listen="0.0.0.0"
-        V2raySetNoNginxTag
-    fi
-
-    Println "  监听地址: $green $listen ${normal}"
-
-    V2raySetPort
-    protocol="vmess"
-    network="ws"
-    V2raySetPath
-
-    new_inbound=$(
-    $JQ_FILE -n --arg listen "$listen" --arg port "$port" \
-        --arg protocol "$protocol" --arg network "$network" \
-        --arg path "$ws_path" --arg tag "$tag" \
-    '{
-        "listen": $listen,
-        "port": $port | tonumber,
-        "protocol": $protocol,
-        "settings": {
-            "clients": []
-        },
-        "streamSettings": {
-            "network": $network,
-            "wsSettings": {
-                "path": $path
-            }
-        },
-        "tag": $tag
-    }')
-
-    JQ add "$V2_CONFIG" inbounds "[$new_inbound]"
-
-    Println "$info 账号组添加成功\n"
-}
-
-V2rayAddNginxAccount()
-{
-    [ "$inbounds_nginx_count" -eq 0 ] && Println "$error 没有账号组, 请先添加组\n" && exit 1
-    echo -e "输入组序号"
-    while read -p "(默认: 取消): " nginx_num
-    do
-        case "$nginx_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$nginx_num" -gt 0 ] && [ "$nginx_num" -le $inbounds_nginx_count ]
-                then
-                    nginx_num=$((nginx_num-1))
-                    nginx_index=${inbounds_nginx_index[nginx_num]}
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
-
-    V2raySetLevel
-    V2raySetId
-    V2raySetAlterId
-    V2raySetEmail
-    jq_path='["inbounds",'"$nginx_index"',"settings","clients"]'
-    new_account=$(
-    $JQ_FILE -n --arg id "$id" --arg level "$level" \
-        --arg alterId "$alter_id" --arg email "$email" \
-    '{
-        "id": $id,
-        "level": $level | tonumber,
-        "alterId": $alterId | tonumber,
-        "email": $email
-    }')
-
-    JQ add "$V2_CONFIG" "[$new_account]"
-    Println "$info 账号添加成功\n"
-}
-
-V2rayDeleteNginxAccount()
-{
-    echo "输入序号"
-    while read -p "(默认: 取消): " nginx_num
-    do
-        case "$nginx_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$nginx_num" -gt 0 ] && [ "$nginx_num" -le $inbounds_nginx_count ]
-                then
-                    nginx_num=$((nginx_num-1))
-                    nginx_index=${inbounds_nginx_index[nginx_num]}
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
-
-    accounts_count=0
-    accounts_list=""
-    while IFS="=" read -r map_id map_level map_alter_id map_email
-    do
-        accounts_count=$((accounts_count+1))
-        accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6CID: $green$map_id${normal} 等级: $green$map_level${normal} alterId: $green$map_alter_id${normal} 邮箱: $green$map_email${normal}\n\n"
-    done < <($JQ_FILE -r '.inbounds['"$nginx_index"'].settings.clients[] | [.id,.level,.alterId,.email] | join("=")' "$V2_CONFIG")
-
-    if [ -z "$accounts_list" ] 
-    then
-        Println "$error 此账户组没有账号\n" && exit 1
-    else
-        V2rayListDomainsInbound
-        accounts_list=$accounts_list"# $green$((accounts_count+1))${normal}\r\033[6C删除所有账号"
-        echo -e "可用账号:\n\n$accounts_list\n"
-        echo "输入序号"
-        while read -p "(默认: 取消): " accounts_index
-        do
-            case "$accounts_index" in
-                "")
-                    Println "已取消...\n" && exit 1
-                ;;
-                *[!0-9]*)
-                    Println "$error 请输入正确的序号\n"
-                ;;
-                *)
-                    if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+1)) ]
-                    then
-                        accounts_index=$((accounts_index-1))
-                        break
-                    else
-                        Println "$error 请输入正确的序号\n"
-                    fi
-                ;;
-            esac
-        done
-
-        if [ "$accounts_index" == "$accounts_count" ] 
-        then
-            jq_path='["inbounds",'"$match_index"',"settings","clients"]'
-            JQ replace "$V2_CONFIG" "[]"
-        else
-            jq_path='["inbounds",'"$match_index"',"settings","clients"]'
-            JQ delete "$V2_CONFIG" "$accounts_index"
-        fi
-        Println "$info 账号删除成功\n"
-    fi
-}
-
 V2raySetListen()
 {
-    if [ "$forward_num" -eq 1 ] || [ "$forward_num" -eq 3 ]
+    echo
+    inquirer text_input "输入监听地址: " listen "0.0.0.0"
+}
+
+V2raySetFollowRedirect()
+{
+    Println "$tip 如果选 是, 安全起见需要你自己设置透明代理的防火墙 详见: https://www.v2fly.org/config/protocols/dokodemo.html"
+    yn_options=( '否' '是' )
+    inquirer list_input "识别出由 iptables 转发而来的数据, 并转发到相应的目标地址" yn_options follow_redirect
+    if [ "$follow_redirect" == "否" ] 
     then
-        echo
-        yn_options=( '否' '是' )
-        inquirer list_input "是否对外公开" yn_options public_address_yn
-        if [[ $public_address_yn == "是" ]]
-        then
-            listen="0.0.0.0"
-        else
-            listen="127.0.0.1"
-        fi
+        follow_redirect="false"
     else
-        listen="0.0.0.0"
+        follow_redirect="true"
     fi
-    Println "  监听地址: $green $listen ${normal}"
 }
 
 V2raySetAddress()
 {
-    Println "输入服务器地址(ip或域名)"
-    read -p "(默认: 取消): " address
-    [ -z "$address" ] && Println "已取消...\n" && exit 1
-    Println "  服务器地址: $green $address ${normal}"
+    echo
+    inquirer text_input "输入目标服务器地址(ip或域名): " address "取消"
+    if [ "$address" == "取消" ] 
+    then
+        Println "已取消...\n"
+        exit 1
+    fi
 }
 
-V2raySetPort()
+V2raySetDnsAddress()
 {
-    Println "请输入端口"
+    Println "$tip 当不指定时, 保持来源中指定的地址不变"
+    inquirer text_input "修改 DNS 服务器地址: " dns_address "不指定"
+    if [ "$dns_address" == "不指定" ] 
+    then
+        dns_address=""
+    fi
+}
+
+V2raySetLocalPort()
+{
+    Println "请输入端口, 可以是 整型数值, 环境变量, 端口范围"
     while read -p "(默认: 随机生成): " port
     do
         case "$port" in
@@ -22547,7 +22178,12 @@ V2raySetPort()
                 break
             ;;
             *[!0-9]*)
-                Println "$error 请输入正确的数字！(1-65535) \n"
+                if [[ $port =~ ^([0-9]+)-([0-9]+)$ ]] 
+                then
+                    break
+                else
+                    Println "$error 输入错误 \n"
+                fi
             ;;
             *)
                 if [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
@@ -22567,12 +22203,12 @@ V2raySetPort()
     Println "  端口: $green $port ${normal}"
 }
 
-V2raySetOutboundPort()
+V2raySetAddressPort()
 {
     Println "请输入端口"
-    while read -p "(默认: 取消): " port
+    while read -p "(默认: 取消): " address_port
     do
-        case "$port" in
+        case "$address_port" in
             "")
                 Println "已取消...\n" && exit 1
             ;;
@@ -22580,7 +22216,7 @@ V2raySetOutboundPort()
                 Println "$error 请输入正确的数字！\n"
             ;;
             *)
-                if [ "$port" -gt 0 ]
+                if [ "$address_port" -gt 0 ] && [ "$address_port" -le 65535 ]
                 then
                     break
                 else
@@ -22589,114 +22225,367 @@ V2raySetOutboundPort()
             ;;
         esac
     done
-    Println "  端口: $green $port ${normal}"
+    Println "  端口: $green $address_port ${normal}"
 }
 
-V2raySetProtocol()
+V2raySetDnsPort()
 {
-    Println "选择协议
+    Println "$tip 当不指定时, 保持来源中指定的端口不变"
+    inquirer text_input "修改 DNS 服务器端口: " dns_port "不指定"
+    if [ "$dns_port" == "不指定" ] 
+    then
+        dns_port=""
+    fi
+}
 
-  ${green}1.${normal} vmess
-  ${green}2.${normal} http
- \n"
-    while true 
-    do
-        if [ "$forward_num" -eq 1 ] 
+V2raySetDokodemoDoorNetwork()
+{
+    Println "$tip 比如当指定为 tcp 时, 任意门仅会接收 TCP 流量"
+    dokodemo_door_network_options=( 'tcp' 'udp' 'tcp,udp' )
+    inquirer list_input "可接收的网络协议类型" dokodemo_door_network_options dokodemo_door_network
+}
+
+V2raySetDnsNetwork()
+{
+    Println "$tip 当不指定时, 保持来源的传输方式不变"
+    dns_network_options=( 'tcp' 'udp' '不指定' )
+    inquirer list_input "DNS 流量的传输层协议" dns_network_options dns_network
+    if [ "$dns_network" == "不指定" ] 
+    then
+        dns_network=""
+    fi
+}
+
+V2raySetInboundProtocol()
+{
+    echo
+    protocol_options=( 'vmess' 'vless' 'http' 'dokodemo-door' )
+    inquirer list_input "选择传输协议" protocol_options protocol
+}
+
+V2raySetOutboundProtocol()
+{
+    echo
+    protocol_options=( 'vmess' 'vless' 'http' 'blackhole' 'dns' 'freedom' )
+    inquirer list_input "选择传输协议" protocol_options protocol
+}
+
+V2raySetInboundNetwork()
+{
+    echo
+    network_options=( 'ws' 'tcp' 'kcp' 'http/2' 'quic' 'domainsocket' )
+    inquirer list_input "选择传输方式" network_options network
+    if [ "$network" == "http/2" ] 
+    then
+        network="http"
+    fi
+}
+
+V2raySetOutboundNetwork()
+{
+    echo
+    network_options=( 'ws' 'tcp' 'kcp' 'http/2' 'quic' )
+    inquirer list_input "选择传输方式" network_options network
+    if [ "$network" == "http/2" ] 
+    then
+        network="http"
+    fi
+}
+
+V2raySetSecurity()
+{
+    echo
+    security_options=( 'none' 'tls' )
+    inquirer list_input "选择传输加密" security_options security
+}
+
+V2raySetServerName()
+{
+    Println "$tip 在连接由 IP 建立时有用"
+    inquirer text_input "指定服务器端证书的域名" server_name "不设置"
+    if [ "$server_name" == "不设置" ] 
+    then
+        server_name=""
+    fi
+}
+
+V2raySetAllowInsecure()
+{
+    Println "$tip 在自定义证书的情况开可以选 否"
+    allowInsecure_options=( '是' '否' )
+    inquirer list_input "是否检测证书有效性" allowInsecure_options allow_insecure
+    if [[ $allow_insecure == "是" ]]
+    then
+        allow_insecure="false"
+    else
+        allow_insecure="true"
+    fi
+}
+
+V2raySetAlpn()
+{
+    if [ -n "${new_inbound:-}" ] && [ "$protocol" == "vless" ] && [ "$network" == "tcp" ]
+    then
+        Println "$tip 多个 ALPN 值用空格分隔, 如果要设置 vless 协议回落这里至少需要 http/1.1"
+    else
+        Println "$tip 多个 ALPN 值用空格分隔"
+    fi
+    inquirer text_input "指定 ALPN 值" alpn "h2 http/1.1"
+    IFS=" " read -r -a alpns <<< "$alpn"
+    printf -v alpn ',"%s"' "${alpns[@]}"
+    alpn=${alpn:1}
+}
+
+V2raySetDisableSystemRoot()
+{
+    Println "$tip 不禁用时只会使用操作系统自带的 CA 证书进行 TLS 握手"
+    yn_options=( '否' '是' )
+    inquirer list_input "是否禁用操作系统自带的 CA 证书" yn_options disable_system_root
+    if [ "$disable_system_root" == "否" ] 
+    then
+        disable_system_root="false"
+    else
+        disable_system_root="true"
+    fi
+}
+
+V2raySetCertificates()
+{
+    echo
+    usage_options=( 'TLS 认证和加密' '验证远端 TLS 的证书' '签发其它证书' )
+    inquirer list_input "选择证书用途" usage_options usage
+    if [ "$usage" == "TLS 认证和加密" ] 
+    then
+        usage="encipherment"
+    elif [ "$usage" == "验证远端 TLS 的证书" ] 
+    then
+        usage="verify"
+    else
+        usage="issue"
+    fi
+
+    echo
+    add_crt_options=( '新建证书' '输入证书地址' )
+    inquirer list_input "选择添加证书方式" add_crt_options add_crt_option
+    if [ "$add_crt_option" == "输入证书地址" ] 
+    then
+        Println "$tip 如使用 OpenSSL 生成, 后缀名为 .crt, 文件必须存在"
+        inquirer text_input "输入证书文件路径: " certificate_file
+        if [ -s "$certificate_file" ] 
         then
-            read -p "(默认: 2): " protocol_num
-            protocol_num=${protocol_num:-2}
+            cp -f "$certificate_file" /usr/local/share/v2ray/
+            certificate_file="/usr/local/share/v2ray/${certificate_file##*/}"
+            chown v2ray:v2ray /usr/local/share/v2ray/*
+            Println "$info 已复制证书到 $certificate_file 并赋予 v2ray:v2ray 权限"
         else
-            read -p "(默认: 1): " protocol_num
-            protocol_num=${protocol_num:-1}
+            Println "$error 证书不存在, 请稍后手动添加证书并赋予 v2ray 权限(chown v2ray:v2ray $certificate_file)"
         fi
-        case $protocol_num in
-            1) 
-                protocol="vmess"
-                break
-            ;;
-            2) 
-                protocol="http"
-                break
-            ;;
-            *) Println "$error 输入错误\n"
-            ;;
-        esac
-    done
-    Println "  协议: $green $protocol ${normal}"
+
+        if [ "$usage" == "verify" ] 
+        then
+            echo
+            yn_options=( '否' '是' )
+            inquirer list_input "是否继续添加证书密钥" yn_options continue_yn
+            if [ "$continue_yn" == "否" ] 
+            then
+                certificate=$(
+                $JQ_FILE -n --arg usage "$usage" --arg certificateFile "$certificate_file" \
+                '{
+                    "usage": $usage,
+                    "certificateFile": $certificateFile
+                }')
+                return 0
+            fi
+        fi
+
+        Println "$tip 如使用 OpenSSL 生成, 后缀名为 .key, 密钥必须存在"
+        inquirer text_input "输入证书密钥路径: " key_file
+        if [ -s "$key_file" ] 
+        then
+            cp -f "$key_file" /usr/local/share/v2ray/
+            key_file="/usr/local/share/v2ray/${key_file##*/}"
+            chown v2ray:v2ray /usr/local/share/v2ray/*
+            Println "$info 已复制密钥到 $key_file 并赋予 v2ray:v2ray 权限"
+        else
+            Println "$error 密钥不存在, 请稍后手动添加密钥并赋予 v2ray 权限(chown v2ray:v2ray $key_file)"
+        fi
+
+        certificate=$(
+        $JQ_FILE -n --arg usage "$usage" --arg certificateFile "$certificate_file" \
+            --arg keyFile "$key_file" \
+        '{
+            "usage": $usage,
+            "certificateFile": $certificateFile,
+            "keyFile": $keyFile
+        }')
+
+        return 0
+    fi
+
+    echo
+    sign_options=( '自签名证书' '选择现有/请求证书' )
+    inquirer list_input "选择签名类型" sign_options sign
+
+    if [ "$sign" == "自签名证书" ] 
+    then
+        if [ "$usage" == "encipherment" ] 
+        then
+            echo
+            yn_options=( '是' '否' )
+            inquirer list_input "是否是 CA 证书" yn_options ca_yn
+            if [ "$ca_yn" == "是" ] 
+            then
+                crt=$($V2CTL_FILE cert -ca)
+            else
+                crt=$($V2CTL_FILE cert)
+            fi
+        else
+            crt=$($V2CTL_FILE cert -ca)
+        fi
+        certificate=$($JQ_FILE "{\"usage\":\"$usage\"} * ." <<< "$crt")
+    else
+        if ls -A /usr/local/share/v2ray/*.crt > /dev/null 2>&1 
+        then
+            crt_options=()
+            for f in /usr/local/share/v2ray/*.crt
+            do
+                domain=${f##*/}
+                domain=${domain%.*}
+                crt_options+=("$domain")
+            done
+            crt_options+=("添加域名")
+            echo
+            inquirer list_input "选择证书" crt_options crt_option
+        else
+            crt_option="添加域名"
+        fi
+        if [ "$crt_option" == "添加域名" ] 
+        then
+            Println "$tip 请确保没有程序占用 80 端口"
+            inquirer text_input "输入域名: " domain "取消"
+            if [ "$domain" == "取消" ] 
+            then
+                Println "已取消..."
+                exit 1
+            fi
+            if [ ! -s "/usr/local/share/v2ray/$domain.crt" ] 
+            then
+                if [ -s "/usr/local/nginx/conf/sites_crt/$domain.crt" ] 
+                then
+                    cp -f "/usr/local/nginx/conf/sites_crt/$domain.crt" "/usr/local/share/v2ray/$domain.crt"
+                    cp -f "/usr/local/nginx/conf/sites_crt/$domain.key" "/usr/local/share/v2ray/$domain.key"
+                elif [ -s "/usr/local/openresty/nginx/conf/sites_crt/$domain.crt" ] 
+                then
+                    cp -f "/usr/local/openresty/nginx/conf/sites_crt/$domain.crt" "/usr/local/share/v2ray/$domain.crt"
+                    cp -f "/usr/local/openresty/nginx/conf/sites_crt/$domain.key" "/usr/local/share/v2ray/$domain.key"
+                else
+                    Println "$info 安装证书..."
+
+                    if [ ! -e "$HOME/.acme.sh/acme.sh" ] 
+                    then
+                        CheckRelease lite
+                        if [ "$release" == "rpm" ] 
+                        then
+                            yum -y install socat > /dev/null
+                        else
+                            apt-get -y install socat > /dev/null
+                        fi
+                        bash <(curl -s -m 20 https://get.acme.sh) > /dev/null
+                    fi
+
+                    ~/.acme.sh/acme.sh --force --issue -d "$domain" --standalone -k ec-256 > /dev/null
+                    ~/.acme.sh/acme.sh --force --installcert -d "$domain" --fullchainpath "/usr/local/share/v2ray/$domain.crt" --keypath "/usr/local/share/v2ray/$domain.key" --ecc > /dev/null
+
+                    Println "$info 证书安装完成..."
+                fi
+            fi
+            chown v2ray:v2ray /usr/local/share/v2ray/*
+            certificate=$(
+            $JQ_FILE -n --arg usage "$usage" --arg certificateFile "/usr/local/share/v2ray/$domain.crt" \
+                --arg keyFile "/usr/local/share/v2ray/$domain.key" \
+            '{
+                "usage": $usage,
+                "certificateFile": $certificateFile,
+                "keyFile": $keyFile
+            }')
+        else
+            certificate=$(
+            $JQ_FILE -n --arg usage "$usage" --arg certificateFile "/usr/local/share/v2ray/$crt_option.crt" \
+                --arg keyFile "/usr/local/share/v2ray/$crt_option.key" \
+            '{
+                "usage": $usage,
+                "certificateFile": $certificateFile,
+                "keyFile": $keyFile
+            }')
+        fi
+    fi
 }
 
-V2raySetStreamNetwork()
+V2raySetTproxy()
 {
-    Println "选择网络类型
-
-  ${green}1.${normal} tcp
-  ${green}2.${normal} kcp
-  ${green}3.${normal} ws
-  ${green}4.${normal} http
-  ${green}5.${normal} domainsocket
-  ${green}6.${normal} quic
-"
-    while read -p "(默认: 3): " network_num 
-    do
-        case $network_num in
-            1) 
-                network="tcp"
-                break
-            ;;
-            2) 
-                network="kcp"
-                break
-            ;;
-            ""|3) 
-                network="ws"
-                break
-            ;;
-            4) 
-                network="http"
-                break
-            ;;
-            5) 
-                network="domainsocket"
-                break
-            ;;
-            6) 
-                network="quic"
-                break
-            ;;
-            *) Println "$error 输入错误\n"
-            ;;
-        esac
-    done
-    Println "  网络: $green $protocol ${normal}"
+    echo
+    tproxy_options=( 'off' 'redirect' 'tproxy' )
+    inquirer list_input "设置透明代理模式" tproxy_options tproxy
 }
 
 V2raySetPath()
 {
     echo
-    inquirer text_input "输入 ws 路径: " ws_path "随机"
-    if [ "$ws_path" == "随机" ]
+    inquirer text_input "输入路径: " path "随机"
+    if [ "$path" == "随机" ]
     then
-        ws_path="/$(RandStr)"
+        path="/$(RandStr)"
+        Println "  路径: $green $path ${normal}"
     fi
-    Println "  路径: $green $ws_path ${normal}"
+}
+
+V2raySetHeaders()
+{
+    headers=""
+    while true 
+    do
+        echo
+        inquirer text_input "输入自定义 HTTP 头的名称: " header_name "不设置"
+        if [ "$header_name" == "不设置" ] 
+        then
+            break
+        fi
+        echo
+        inquirer text_input "输入自定义 HTTP 头 $header_name 的值: " header_value "不设置"
+        if [ "$header_value" == "不设置" ] 
+        then
+            break
+        fi
+        [ -n "$headers" ] && headers="$headers, "
+        headers="$headers\"$header_name\":\"$header_value\""
+        yn_options=( '否' '是' )
+        inquirer list_input "是否继续添加" yn_options continue_yn
+        if [ "$continue_yn" == "否" ] 
+        then
+            break
+        fi
+    done
 }
 
 V2raySetId()
 {
-    Println "输入 id"
-    read -p "(默认: 随机): " id
-    id=${id:-$($V2CTL_FILE uuid)}
-    Println "  id: $green $id ${normal}"
+    echo
+    inquirer text_input "输入 id: " id "随机"
+    if [ "$id" == "随机" ] 
+    then
+        id=$($V2CTL_FILE uuid)
+        Println "  id: $green $id ${normal}"
+    fi
 }
 
 V2raySetAlterId()
 {
     Println "请输入 alterId"
-    while read -p "(默认: 64): " alter_id
+    while read -p "(默认: 0): " alter_id
     do
         case "$alter_id" in
             "")
-                alter_id=64
+                alter_id=0
                 break
             ;;
             *[!0-9]*)
@@ -22717,20 +22606,23 @@ V2raySetAlterId()
 
 V2raySetEmail()
 {
-    Println "输入邮箱"
-    read -p "(默认: 随机): " email
-    email=${email:-$(RandStr)@localhost}
-    Println "  邮箱: $green $email ${normal}"
+    echo
+    inquirer text_input "输入邮箱: " email "随机"
+    if [ "$email" == "随机" ] 
+    then
+        email="$(RandStr)@localhost"
+        Println "  邮箱: $green $email ${normal}"
+    fi
 }
 
 V2raySetTimeout()
 {
     Println "入站数据的时间限制(秒)"
-    while read -p "(默认: 60): " timeout
+    while read -p "(默认: 300): " timeout
     do
         case "$timeout" in
             "")
-                timeout=60
+                timeout=300
                 break
             ;;
             *[!0-9]*)
@@ -22746,7 +22638,7 @@ V2raySetTimeout()
             ;;
         esac
     done
-    Println "  timeout: $green $timeout ${normal}"
+    Println "  时间限制: $green $timeout ${normal}"
 }
 
 V2raySetAllowTransparent()
@@ -22763,45 +22655,60 @@ V2raySetAllowTransparent()
     Println "  allowTransparent: $green $allow_transparent ${normal}"
 }
 
-V2raySetAllowInsecure()
-{
-    Println "$tip 在自定义证书的情况开可以选 否"
-    allowInsecure_options=( '是' '否' )
-    inquirer list_input "是否检测证书有效性: " allowInsecure_options allow_insecure
-    if [[ $allow_insecure == "是" ]]
-    then
-        allow_insecure="false"
-    else
-        allow_insecure="true"
-    fi
-}
-
-V2rayListLevels()
-{
-    V2rayGetLevels
-    Println "\n=== 用户等级数 $green $levels_count ${normal}"
-
-    levels_list=""
-    for((i=0;i<levels_count;i++));
-    do
-        if [ -n "${levels_bufferSize[i]}" ] 
-        then
-            buffer_size=${levels_bufferSize[i]}
-            buffer_size_list=" bufferSize: $green${buffer_size}${normal}"
-        else
-            buffer_size=""
-            buffer_size_list=" bufferSize: $green自动${normal}"
-        fi
-
-        levels_list=$levels_list"# $green$((i+1))${normal}\r\033[6C等级: $green${levels_id[i]}${normal} 握手: $green${levels_handshake[i]}${normal} 超时: $green${levels_connIdle[i]}${normal}\n\r\033[6C下行中断: $green${levels_uplinkOnly[i]}${normal} 上行中断: $green${levels_downlinkOnly[i]}${normal}\n\r\033[6C上行流量统计: $green${levels_statsUserUplink[i]}${normal} 下行流量统计: $green${levels_statsUserDownlink[i]}${normal}$buffer_size_list\n\n"
-    done
-    Println "$levels_list\n"
-    return 0
-}
-
 V2raySetLevel()
 {
-    V2rayListLevels
+    V2rayGetPolicy
+
+    if [ "$policy_levels_count" -eq 0 ] 
+    then
+        default_levels='{
+            "levels": {
+                "0": {
+                    "handshake": 4,
+                    "connIdle": 300,
+                    "uplinkOnly": 2,
+                    "downlinkOnly": 5,
+                    "statsUserUplink": false,
+                    "statsUserDownlink": false,
+                    "bufferSize": 512
+                }
+            },
+            "system": {
+                "statsInboundUplink": false,
+                "statsInboundDownlink": false,
+                "statsOutboundUplink": false,
+                "statsOutboundDownlink": false
+            }
+        }'
+        jq_path='["policy"]'
+        JQ replace "$V2_CONFIG" "$default_levels"
+        jq_path='["PolicyObject"]'
+        JQ delete "$V2_CONFIG"
+        V2rayGetPolicy
+    fi
+
+    Println "\n=== 用户等级数 $green $policy_levels_count ${normal}"
+
+    levels_list=""
+    for((i=0;i<policy_levels_count;i++));
+    do
+        if [ "${policy_levels_stats_user_uplink[i]}" == "true" ] 
+        then
+            policy_levels_stats_user_uplink_list="\n\033[6C上行流量统计: $green是${normal}"
+        else
+            policy_levels_stats_user_uplink_list="\n\033[6C上行流量统计: $red否${normal}"
+        fi
+        if [ "${policy_levels_stats_user_downlink[i]}" == "true" ] 
+        then
+            policy_levels_stats_user_downlink_list="\n\033[6C下行流量统计: $green是${normal}"
+        else
+            policy_levels_stats_user_downlink_list="\n\033[6C下行流量统计: $red否${normal}"
+        fi
+        levels_list=$levels_list"# $green$((i+1))${normal}\r\033[6C等级: $green${policy_levels_id[i]}${normal}\n\033[6C握手时间限制: $green${policy_levels_handshake[i]}${normal} 秒\n\033[6C连接空闲的时间限制: $green${policy_levels_conn_idle[i]}${normal} 秒\n\033[6C出站代理时间限制: $green${policy_levels_uplink_only[i]}${normal} 秒\n\033[6C入站代理时间限制: $green${policy_levels_downlink_only[i]}${normal} 秒\n\033[6C缓存大小: $green${policy_levels_buffer_size[i]}${normal} kB$policy_levels_stats_user_uplink_list$policy_levels_stats_user_downlink_list\n\n"
+    done
+
+    Println "$levels_list\n"
+
     echo -e "选择等级"
     while read -p "(默认: 1): " level
     do
@@ -22814,7 +22721,7 @@ V2raySetLevel()
                 Println "$error 请输入正确的序号\n"
             ;;
             *)
-                if [ "$level" -gt 0 ] && [ "$level" -le $((levels_count+1)) ]
+                if [ "$level" -gt 0 ] && [ "$level" -le $((policy_levels_count+1)) ]
                 then
                     level=$((level-1))
                     break
@@ -22829,305 +22736,2189 @@ V2raySetLevel()
 
 V2raySetHttpAccount()
 {
-    Println "输入用户名"
-    read -p "(默认: 随机): " user
-    user=${user:-$(RandStr)}
-    Println "  用户名: $green $user ${normal}\n"
-    echo "输入密码"
-    read -p "(默认: 随机): " pass
-    pass=${pass:-$(RandStr)}
-    Println "  密码: $green $pass ${normal}\n"
+    echo
+    inquirer text_input "输入用户名: " user "随机"
+    if [ "$user" == "随机" ] 
+    then
+        user=$(RandStr)
+        Println "  用户名: $green $user ${normal}"
+    fi
+    echo
+    inquirer text_input "输入密码: " pass "随机"
+    if [ "$pass" == "随机" ] 
+    then
+        pass=$(RandStr)
+        Println "  密码: $green $pass ${normal}"
+    fi
 }
 
 V2raySetTag()
 {
-    Println "输入组名"
-    read -p "(默认: 随机): " tag
-    tag=${tag//nginx-/}
-    tag=${tag:-$(GetFreeTag)}
-    Println "  组名: $green $tag ${normal}"
+    echo
+    inquirer text_input "输入标签: " tag "随机"
+    if [ "$tag" == "随机" ] 
+    then
+        tag=$(GetFreeTag)
+        tag=${tag//nginx-/}
+        Println "  标签: $green $tag ${normal}"
+    fi
 }
 
-V2raySetSecurity()
+V2raySetNginxTag()
 {
-    Println "选择加密方式
-
-  ${green}1.${normal} aes-128-gcm
-  ${green}2.${normal} chacha20-poly1305
-  ${green}3.${normal} auto
-  ${green}4.${normal} none
-    \n"
-    while read -p "(默认: 3): " security_num 
+    i=0
+    while true 
     do
-        case $security_num in
-            1) 
-                security="aes-128-gcm"
+        i=$((i+1))
+        tag="nginx-$i"
+        if ! grep -q '"tag": "'"$tag"'"' < "$V2_CONFIG"
+        then
+            break
+        fi
+    done
+    Println "  标签: $green $tag ${normal}\n"
+}
+
+V2raySetAcceptProxyProtocol()
+{
+    Println "$tip PROXY 协议专用于传递请求的真实来源 IP 和端口"
+    accept_proxy_protocol_options=( '否' '是' )
+    inquirer list_input "是否接收 PROXY 协议" accept_proxy_protocol_options accept_proxy_protocol
+    if [[ $accept_proxy_protocol == "是" ]] 
+    then
+        accept_proxy_protocol="true"
+    else
+        accept_proxy_protocol="false"
+    fi
+}
+
+V2raySetVmessSecurity()
+{
+    echo
+    vmess_security_options=( 'auto' 'aes-128-gcm' 'chacha20-poly1305' 'none' )
+    inquirer list_input "选择加密方式" vmess_security_options vmess_security
+}
+
+V2raySetQuicSecurity()
+{
+    echo
+    quic_security_options=( 'none' 'aes-128-gcm' 'chacha20-poly1305' )
+    inquirer list_input "设置 QUIC 加密方式" quic_security_options quic_security
+}
+
+V2raySetQuicKey()
+{
+    if [ "$quic_security" == "none" ] 
+    then
+        quic_key=""
+    else
+        echo
+        inquirer text_input "输入 QUIC 加密密钥: " quic_key "随机"
+        if [[ $quic_key == "随机" ]] 
+        then
+            quic_key=$(RandStr)
+        fi
+    fi
+}
+
+V2raySetDsPath()
+{
+    Println "$tip 在运行 V2Ray 之前, 这个文件必须不存在"
+    inquirer text_input "输入 domainsocket 文件路径: " ds_path "取消"
+    if [ "$ds_path" == "取消" ]
+    then
+        Println "已取消...\n"
+        exit 1
+    fi
+    Println "  domainsocket 文件路径: $green $ds_path ${normal}"
+}
+
+V2raySetDsAbstract()
+{
+    echo
+    yn_options=( '否' '是' )
+    inquirer list_input "是否为 abstract domain socket" yn_options ds_abstract
+    if [[ $ds_abstract == "否" ]] 
+    then
+        ds_abstract="false"
+    else
+        ds_abstract="true"
+    fi
+}
+
+V2raySetDsPadding()
+{
+    echo
+    yn_options=( '否' '是' )
+    inquirer list_input "abstract domain socket 是否带 padding" yn_options ds_padding
+    if [[ $ds_padding == "否" ]] 
+    then
+        ds_padding="false"
+    else
+        ds_padding="true"
+    fi
+}
+
+V2raySetDetourTo()
+{
+    Println "$tip 指定的入站协议必须是 VMess"
+    inquirer text_input "使用另一个入站的出站(输入指定的另一个入站的标签): " detour_to "不设置"
+    Println "  指定的另一个入站: $green $detour_to ${normal}"
+}
+
+V2raySetDetourDefault()
+{
+    V2raySetLevel
+    V2raySetAlterId
+}
+
+V2raySetDisableInsecureEncryption()
+{
+    yn_options=( '是' '否' )
+    Println "$tip 当客户端使用 none / aes-128-cfb 加密方式时, 服务器会主动断开连接"
+    inquirer list_input "是否禁止客户端使用不安全的加密方式" yn_options disable_insecure_encryption
+    if [[ $disable_insecure_encryption == "是" ]] 
+    then
+        disable_insecure_encryption="true"
+    else
+        disable_insecure_encryption="false"
+    fi
+}
+
+V2raySetHeaderType()
+{
+    echo
+    if [ "$network" == "tcp" ] 
+    then
+        header_type_options=( 'none' 'http' )
+    else
+        header_type_options=( 'none' 'srtp' 'utp' 'wechat-video' 'dtls' 'wireguard' )
+    fi
+    inquirer list_input "设置数据包头部伪装" header_type_options header_type
+}
+
+V2raySetHost()
+{
+    Println "$tip 多个域名用空格分隔, 客户端会随机从列表中选出一个域名进行通信, 服务器会验证域名是否在列表中"
+    inquirer text_input "输入通信域名: " host "v2ray.com"
+    IFS=" " read -r -a hosts <<< "$host"
+    printf -v host ',"%s"' "${hosts[@]}"
+    host=${host:1}
+}
+
+V2raySetSniffingEnabled()
+{
+    echo
+    yn_options=( '否' '是' )
+    inquirer list_input "是否开启流量探测" yn_options sniffing_enabled
+    if [[ $sniffing_enabled == "否" ]] 
+    then
+        sniffing_enabled="false"
+    else
+        sniffing_enabled="true"
+    fi
+}
+
+V2raySetSniffingDestOverride()
+{
+    echo
+    dest_override_options=( 'tls' 'http' 'http,tls' )
+    inquirer list_input "指定流量类型" dest_override_options dest_override
+    if [[ $dest_override == "http,tls" ]] 
+    then
+        dest_override='"http","tls"'
+    else
+        dest_override='"'$dest_override'"'
+    fi
+}
+
+SetV2rayAllocateStrategy()
+{
+    echo
+    allocate_strategy_options=( 'always' 'random' )
+    inquirer list_input "端口分配策略" allocate_strategy_options allocate_strategy
+}
+
+SetV2rayAllocateRefresh()
+{
+    Println "随机端口刷新间隔(分钟)"
+    while read -p "(默认: 5): " allocate_refresh
+    do
+        case "$allocate_refresh" in
+            "")
+                allocate_refresh=5
                 break
             ;;
-            2) 
-                security="chacha20-poly1305"
-                break
+            *[!0-9]*)
+                Println "$error 请输入正确的数字(大于1) \n"
             ;;
-            ""|3) 
-                security="auto"
-                break
-            ;;
-            4) 
-                security="none"
-                break
-            ;;
-            *) Println "$error 输入错误\n"
+            *)
+                if [ "$allocate_refresh" -ge 2 ]
+                then
+                    break
+                else
+                    Println "$error 请输入正确的数字(大于1)\n"
+                fi
             ;;
         esac
     done
-    Println "  加密方式: $green $security ${normal}"
+    Println "  刷新间隔: $green $allocate_refresh ${normal}"
+}
+
+SetV2rayAllocateConcurrency()
+{
+    Println "随机端口数量, 最大值为端口范围的三分之一"
+    while read -p "(默认: 3): " allocate_concurrency
+    do
+        case "$allocate_concurrency" in
+            "")
+                allocate_concurrency=3
+                break
+            ;;
+            *[!0-9]*)
+                Println "$error 请输入正确的数字(大于0) \n"
+            ;;
+            *)
+                if [ "$allocate_concurrency" -ge 1 ]
+                then
+                    break
+                else
+                    Println "$error 请输入正确的数字(大于0)\n"
+                fi
+            ;;
+        esac
+    done
+    Println "  随机端口数量: $green $allocate_concurrency ${normal}"
+}
+
+V2raySetSendThrough()
+{
+    Println "$tip 当主机有多个 IP 地址时有效"
+    inquirer text_input "用于发送数据的 IP 地址: " send_through "0.0.0.0"
+}
+
+V2raySetProxy()
+{
+    Println "$tip 如果指定另一个出站协议, 当前协议发出的数据, 将从指定的出站协议发出"
+    inquirer text_input "输入指定的另一个出站协议的标签: " proxy_tag "不设置"
+    if [ "$proxy_tag" == "不设置" ] 
+    then
+        proxy_tag=""
+    fi
+}
+
+V2raySetMuxEnabled()
+{
+    Println "$info Mux 功能是在一条 TCP 连接上分发多个 TCP 连接的数据, 是为了减少 TCP 的握手延迟而设计, 而非提高连接的吞吐量"
+    yn_options=( '否' '是' )
+    inquirer list_input "是否启用 Mux 转发请求" yn_options mux_enabled
+    if [ "$mux_enabled" == "否" ] 
+    then
+        mux_enabled="false"
+    else
+        mux_enabled="true"
+    fi
+}
+
+V2raySetMuxConcurrency()
+{
+    Println "$tip 最小值 1, 最大值 1024, 填负数, 比如 -1, 则不加载 mux 模块"
+    inquirer text_input "最大并发连接数: " mux_concurrency 8
+}
+
+V2raySetResponseType()
+{
+    Println "$tip none 时直接关闭, http 时返回 403 并关闭"
+    response_type_options=( 'none' 'http' )
+    inquirer list_input "选择黑洞的响应方式" response_type
+}
+
+V2raySetFreedomDomainStrategy()
+{
+    Println "$tip AsIs - 直接向此域名发出连接, 其余将域名用内建的 dns 解析为 IP 之后再建立连接"
+    freedom_domain_strategy_options=( 'AsIs' 'UseIP' 'UseIPv4' 'UseIPv6' )
+    inquirer list_input "域名策略" freedom_domain_strategy_options freedom_domain_strategy
+}
+
+V2raySetFreedomRedirect()
+{
+    Println "例如 127.0.0.1:80, :1234 - 不改变原先的目标地址, v2ray.com:0 - 不改变原先的端口"
+    inquirer text_input "强制将所有数据发送到指定地址: " freedom_redirect "不设置"
+    if [ "$freedom_redirect" == "不设置" ] 
+    then
+        freedom_redirect=""
+    fi
+}
+
+V2raySetFallbacks()
+{
+    echo
+    yn_options=( '否' '是' )
+    inquirer list_input "是否配置协议回落" yn_options vless_fallbacks_yn
+    if [ "$vless_fallbacks_yn" == "是" ] 
+    then
+        vless_fallbacks='{
+            "alpn": "",
+            "path": "",
+            "dest": 80,
+            "xver": 0
+        }'
+        while true 
+        do
+            Println "$tip 请输入单个"
+            inquirer text_input "输入尝试匹配 TLS ALPN 协商结果: " vless_fallback_alpn "不设置"
+            if [ "$vless_fallback_alpn" == "不设置" ] 
+            then
+                vless_fallback_alpn=""
+            elif [ "$vless_fallback_alpn" == "h2" ] && [[ ! $alpn =~ h2 ]]
+            then
+                Println "$error 协议回落存在 h2 时, TLS 需设置 h2 http/1.1\n"
+                exit 1
+            fi
+            Println "$tip 非空则必须以 / 开头, 不支持 h2c"
+            inquirer text_input "输入尝试匹配首包 HTTP PATH: " vless_fallback_path "任意"
+            if [ "$vless_fallback_path" == "任意" ] 
+            then
+                vless_fallback_path=""
+            fi
+            Println "$tip 格式为 addr:port 或 /dev/shm/domain.socket, 若填写域名, 也将直接发起 TCP 连接(而不走内置的 DNS)"
+            inquirer text_input "输入 TLS 解密后 TCP 流量的去向: " vless_fallback_dest
+            if [ -z "$vless_fallback_dest" ] 
+            then
+                Println "$error 已取消...\n"
+                exit 1
+            fi
+            Println "$tip 如果配置 nginx 的 PROXY protocol 记得设置 set_real_ip_from"
+            vless_fallback_proxy_protocol_options=( '不发送' '版本1' '版本2' )
+            inquirer list_input "选择 PROXY protocol" vless_fallback_proxy_protocol_options vless_fallback_proxy_protocol
+            if [ "$vless_fallback_proxy_protocol" == "不发送" ] 
+            then
+                vless_fallback_proxy_protocol=0
+            elif [ "$vless_fallback_proxy_protocol" == "版本1" ] 
+            then
+                vless_fallback_proxy_protocol=1
+            else
+                vless_fallback_proxy_protocol=2
+            fi
+            if [[ $vless_fallback_dest =~ ^[0-9]+$ ]] 
+            then
+                vless_fallbacks=$vless_fallbacks',
+                {
+                    "alpn": "'"$vless_fallback_alpn"'",
+                    "path": "'"$vless_fallback_path"'",
+                    "dest": '"$vless_fallback_dest"',
+                    "xver": '"$vless_fallback_proxy_protocol"'
+                }'
+            else
+                vless_fallbacks=$vless_fallbacks',
+                {
+                    "alpn": "'"$vless_fallback_alpn"'",
+                    "path": "'"$vless_fallback_path"'",
+                    "dest": "'"$vless_fallback_dest"'",
+                    "xver": '"$vless_fallback_proxy_protocol"'
+                }'
+            fi
+            yn_options=( '否' '是' )
+            inquirer list_input "是否继续配置新的协议回落" yn_options vless_fallbacks_yn
+            if [ "$vless_fallbacks_yn" == "否" ] 
+            then
+                break
+            fi
+        done
+    else
+        vless_fallbacks=""
+    fi
 }
 
 V2rayAddInbound()
 {
-    V2raySetListen
-    V2raySetPort
-    V2raySetProtocol
-    V2raySetLevel
-    V2raySetTag
+    V2raySetInboundProtocol
+    V2raySetInboundNetwork
+    V2raySetTproxy
+
+    V2raySetSniffingEnabled
+    if [ "$sniffing_enabled" == "true" ] 
+    then
+        V2raySetSniffingDestOverride
+    else
+        dest_override=""
+    fi
+
+    echo
+    yn_options=( '否' '是' )
+    inquirer list_input "是否通过 nginx 连接" yn_options nginx_proxy_yn
+
+    if [[ $nginx_proxy_yn == "是" ]]
+    then
+        if [ "$protocol" == "vless" ] 
+        then
+            V2raySetSecurity
+        else
+            security="none"
+        fi
+        V2raySetNginxTag
+        listen="127.0.0.1"
+    else
+        V2raySetSecurity
+        V2raySetTag
+        V2raySetListen
+    fi
+
+    if [ "$network" == "domainsocket" ] 
+    then
+        port=$(GetFreePort)
+    else
+        V2raySetLocalPort
+    fi
+
+    new_inbound=$(
+    $JQ_FILE -n --arg listen "$listen" --arg port "$port" \
+        --arg protocol "$protocol" --arg network "$network" \
+        --arg security "$security" --arg tproxy "$tproxy" \
+        --arg enabled "$sniffing_enabled" --argjson destOverride "[$dest_override]" \
+        --arg tag "$tag" \
+    '{
+        "listen": $listen,
+        "port": $port | tonumber,
+        "protocol": $protocol,
+        "streamSettings": {
+            "network": $network,
+            "security": $security,
+            "sockopt": {
+                "tproxy": $tproxy
+            }
+        },
+        "sniffing": {
+            "enabled": $enabled | test("true"),
+            "destOverride": $destOverride
+        },
+        "tag": $tag
+    }')
+
+    if [[ ! "$port" =~ ^[0-9]+$ ]] 
+    then
+        SetV2rayAllocateStrategy
+        if [ "$allocate_strategy" == "random" ] 
+        then
+            SetV2rayAllocateRefresh
+            SetV2rayAllocateConcurrency
+            new_inbound=$(
+            $JQ_FILE --arg strategy "$allocate_strategy" --arg refresh "$allocate_refresh" \
+            --arg concurrency "$allocate_concurrency" \
+            '. * 
+            {
+                "allocate": {
+                    "tlsSettings": {
+                        "strategy": $strategy,
+                        "refresh": $refresh | tonumber,
+                        "concurrency": $concurrency | tonumber
+                    }
+                }
+            }' <<< "$new_inbound")
+        fi
+    fi
+
+    if [ "$security" == "tls" ] 
+    then
+        V2raySetServerName
+        if [ -n "$server_name" ] 
+        then
+            new_inbound=$(
+            $JQ_FILE --arg serverName "$server_name" \
+            '. * 
+            {
+                "streamSettings": {
+                    "tlsSettings": {
+                        "serverName": $serverName
+                    }
+                }
+            }' <<< "$new_inbound")
+        fi
+        V2raySetAlpn
+        V2raySetDisableSystemRoot
+        new_inbound=$(
+        $JQ_FILE --argjson alpn "[$alpn]" --arg disableSystemRoot "$disable_system_root" \
+        '. * 
+        {
+            "streamSettings": {
+                "tlsSettings": {
+                    "alpn": $alpn,
+                    "disableSystemRoot": $disableSystemRoot | test("true"),
+                }
+            }
+        }' <<< "$new_inbound")
+        while true 
+        do
+            if [ "$disable_system_root" == "false" ] 
+            then
+                echo
+                yn_options=( '否' '是' )
+                inquirer list_input "是否继续添加证书" yn_options continue_yn
+                if [ "$continue_yn" == "否" ] 
+                then
+                    break
+                fi
+            fi
+            Println "$info 设置证书"
+            V2raySetCertificates
+            merge=$(
+            $JQ_FILE -n --argjson certificates "[$certificate]" \
+            '{
+                "streamSettings": {
+                    "tlsSettings": {
+                        "certificates": $certificates
+                    }
+                }
+            }')
+            JQs merge new_inbound "$merge"
+            if [ "$disable_system_root" == "true" ] 
+            then
+                echo
+                yn_options=( '否' '是' )
+                inquirer list_input "是否继续添加证书" yn_options continue_yn
+                if [ "$continue_yn" == "否" ] 
+                then
+                    break
+                fi
+            fi
+        done
+    fi
 
     if [ "$protocol" == "vmess" ] 
     then
-        V2raySetStreamNetwork
+        V2raySetDisableInsecureEncryption
+        new_inbound=$(
+        $JQ_FILE --arg disableInsecureEncryption "$disable_insecure_encryption" \
+        '. * 
+        {
+            "settings": {
+                "clients": [],
+                "disableInsecureEncryption":$disableInsecureEncryption | test("true")
+            }
+        }' <<< "$new_inbound")
 
-        if [ "$network" == "ws" ] 
+        V2raySetDetourTo
+        if [ "$detour_to" != "不设置" ] 
         then
-            V2raySetPath
+            V2raySetDetourDefault
             new_inbound=$(
-            $JQ_FILE -n --arg listen "$listen" --arg port "$port" \
-                --arg protocol "$protocol" --arg network "$network" \
-                --arg path "$ws_path" --arg tag "$tag" \
-            '{
-                "listen": $listen,
-                "port": $port | tonumber,
-                "protocol": $protocol,
+            $JQ_FILE --arg level "$level" --arg alterId "$alter_id" --arg to "$detour_to" \
+            '. * 
+            {
                 "settings": {
-                    "clients": []
-                },
-                "streamSettings": {
-                    "network": $network,
-                    "wsSettings": {
-                        "path": $path
+                    "default": {
+                        "level": $level | tonumber,
+                        "alterId": $alterId | tonumber
+                    },
+                    "detour": {
+                        "to": $to
                     }
-                },
-                "tag": $tag
-            }')
-        else
-            new_outbound=$(
-            $JQ_FILE -n --arg listen "$listen" --arg port "$port" \
-            --arg protocol "$protocol" --arg network "$network" \
-            --arg tag "$tag" \
-            '{
-                "listen": $listen,
-                "port": $port | tonumber,
-                "protocol": $protocol,
-                "settings": {
-                    "clients": []
-                },
-                "streamSettings": {
-                    "network": $network
-                },
-                "tag": $tag
-            }')
+                }
+            }' <<< "$new_inbound")
         fi
-    else
+    elif [ "$protocol" == "vless" ] 
+    then
+        new_inbound=$(
+        $JQ_FILE \
+        '. * 
+        {
+            "settings": {
+                "clients": [],
+                "decryption":"none"
+            }
+        }' <<< "$new_inbound")
+        if [ "$security" == "tls" ] && [ "$network" == "tcp" ] && [[ $alpn == *"http/1.1"* ]]
+        then
+            V2raySetFallbacks
+            if [ -n "$vless_fallbacks" ] 
+            then
+                new_inbound=$(
+                $JQ_FILE --argjson fallbacks "[$vless_fallbacks]" \
+                '. * 
+                {
+                    "settings": {
+                        "fallbacks":$fallbacks
+                    }
+                }' <<< "$new_inbound")
+            fi
+        fi
+    elif [ "$protocol" == "http" ] 
+    then
         V2raySetTimeout
         V2raySetAllowTransparent
+        V2raySetLevel
 
         new_inbound=$(
-        $JQ_FILE -n --arg listen "$listen" --arg port "$port" \
-            --arg protocol "$protocol" --arg timeout "$timeout" \
-            --arg allowTransparent "$allow_transparent" --arg userLevel "$level" --arg tag "$tag" \
-        '{
-            "listen": $listen,
-            "port": $port | tonumber,
-            "protocol": "http",
+        $JQ_FILE --arg timeout "$timeout" --arg allowTransparent "$allow_transparent" \
+        --arg userLevel "$level" \
+        '. * 
+        {
             "settings": {
                 "timeout": $timeout | tonumber,
                 "accounts": [],
                 "allowTransparent": $allowTransparent | test("true"),
                 "userLevel": $userLevel | tonumber
-            },
-            "tag": $tag
-        }')
+            }
+        }' <<< "$new_inbound")
+    elif [ "$protocol" == "dokodemo-door" ] 
+    then
+        V2raySetDokodemoDoorNetwork
+        V2raySetTimeout
+        V2raySetLevel
+        V2raySetFollowRedirect
+        if [ "$follow_redirect" == "true" ] 
+        then
+            new_inbound=$(
+            $JQ_FILE --arg network "$dokodemo_door_network" --arg timeout "$timeout" \
+            --arg followRedirect "$follow_redirect" --arg userLevel "$level" \
+            '. * 
+            {
+                "settings": {
+                    "network": $network,
+                    "timeout": $timeout | tonumber,
+                    "followRedirect": $followRedirect | test("true"),
+                    "userLevel": $userLevel | tonumber
+                }
+            }' <<< "$new_inbound")
+        else
+            V2raySetAddress
+            V2raySetAddressPort
+            new_inbound=$(
+            $JQ_FILE --arg address "$address" --arg port "$address_port" \
+            --arg network "$dokodemo_door_network" --arg timeout "$timeout" \
+            --arg followRedirect "$follow_redirect" --arg userLevel "$level" \
+            '. * 
+            {
+                "settings": {
+                    "address": $address,
+                    "port": $port,
+                    "network": $network,
+                    "timeout": $timeout | tonumber,
+                    "followRedirect": $followRedirect | test("true"),
+                    "userLevel": $userLevel | tonumber
+                }
+            }' <<< "$new_inbound")
+        fi
+    fi
+
+    if [ "$network" == "ws" ] 
+    then
+        V2raySetAcceptProxyProtocol
+        V2raySetPath
+        V2raySetHeaders
+        new_inbound=$(
+        $JQ_FILE --arg acceptProxyProtocol "$accept_proxy_protocol" \
+            --arg path "$path" --argjson headers "{$headers}" \
+        '. * 
+        {
+            "streamSettings": {
+                "wsSettings": {
+                    "acceptProxyProtocol": $acceptProxyProtocol | test("true"),
+                    "path": $path,
+                    "headers": $headers
+                }
+            }
+        }' <<< "$new_inbound")
+    elif [ "$network" == "tcp" ] 
+    then
+        V2raySetAcceptProxyProtocol
+        V2raySetHeaderType
+        new_inbound=$(
+        $JQ_FILE --arg acceptProxyProtocol "$accept_proxy_protocol" \
+            --arg header_type "$header_type" \
+        '. * 
+        {
+            "streamSettings": {
+                "tcpSettings": {
+                    "acceptProxyProtocol": $acceptProxyProtocol | test("true"),
+                    "header": {
+                        "type": $header_type
+                    }
+                }
+            }
+        }' <<< "$new_inbound")
+    elif [ "$network" == "kcp" ] 
+    then
+        V2raySetHeaderType
+        new_inbound=$(
+        $JQ_FILE --arg header_type "$header_type" \
+        '. * 
+        {
+            "streamSettings": {
+                "kcpSettings": {
+                    "header": {
+                        "type": $header_type
+                    }
+                }
+            }
+        }' <<< "$new_inbound")
+    elif [ "$network" == "http" ] 
+    then
+        V2raySetHost
+        V2raySetPath
+        new_inbound=$(
+        $JQ_FILE --argjson host "[$host]" \
+            --arg path "$path" \
+        '. * 
+        {
+            "streamSettings": {
+                "httpSettings": {
+                    "host": $host,
+                    "path": $path
+                }
+            }
+        }' <<< "$new_inbound")
+    elif [ "$network" == "quic" ] 
+    then
+        V2raySetQuicSecurity
+        V2raySetQuicKey
+        V2raySetHeaderType
+        new_inbound=$(
+        $JQ_FILE --arg security "$quic_security" \
+            --arg key "$quic_key" --arg header_type "$header_type" \
+        '. * 
+        {
+            "streamSettings": {
+                "quicSettings": {
+                    "security": $security,
+                    "key": $key,
+                    "header": {
+                        "type": $header_type
+                    }
+                }
+            }
+        }' <<< "$new_inbound")
+    else
+        V2raySetDsPath
+        V2raySetDsAbstract
+        V2raySetDsPadding
+        new_inbound=$(
+        $JQ_FILE --arg path "$ds_path" \
+            --arg abstract "$ds_abstract" --arg padding "$ds_padding" \
+        '. * 
+        {
+            "streamSettings": {
+                "dsSettings": {
+                    "path": $ds_path,
+                    "abstract": $abstract | test("true"),
+                    "padding": $padding | test("true")
+                }
+            }
+        }' <<< "$new_inbound")
     fi
 
     JQ add "$V2_CONFIG" inbounds "[$new_inbound]"
 
-    Println "$info 入站转发组添加成功\n"
+    Println "$info 入站 $tag 添加成功\n"
 }
 
-V2raySetStreamSettings()
+V2rayGetInbounds()
 {
-    echo
-    security_options=( '无' 'tls' )
-    inquirer list_input "选择传输安全: " security_options security
-    if [[ $security == "无" ]]
+    IFS=$'`\t' read -r map_listen map_port map_protocol map_settings_disable_insecure_encryption \
+    map_settings_decryption map_settings_timeout map_settings_allow_transparent map_settings_user_level \
+    map_settings_address map_settings_port map_settings_network map_settings_follow_redirect \
+    map_settings_default_level map_settings_default_alter_id map_settings_detour_to map_stream_network \
+    map_stream_security map_stream_tls_server_name map_stream_tls_alpn map_stream_tls_certificates_usage \
+    map_stream_tls_certificates_certificate_file map_stream_tls_certificates_key_file \
+    map_stream_tls_certificates_certificate map_stream_tls_certificates_key \
+    map_stream_tls_disable_system_root map_stream_http_host map_stream_path \
+    map_stream_accept_proxy_protocol map_stream_ws_headers map_stream_header_type \
+    map_stream_quic_security map_stream_quic_key map_stream_ds_abstract \
+    map_stream_ds_padding map_stream_tproxy map_sniffing_enabled map_sniffing_dest_override \
+    map_allocate_strategy map_allocate_refresh map_allocate_concurrency map_tag < <($JQ_FILE -r '[
+    ([.inbounds[]|.listen|if . == "" // . == null then "0.0.0.0" else . end|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.port|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.protocol|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.disableInsecureEncryption // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.decryption // "none"|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.timeout // 300|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.allowTransparent // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.userLevel // ""|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.address|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.port // ""|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.network|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.follow_redirect // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.default.level // 0|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.default.alterId // 0|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.settings.detour.to|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.network|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.security // "none"|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.serverName|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.alpn // []|join("|")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].usage|. + "|"]|join("")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].certificateFile|. + "|"]|join("")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].keyFile|. + "|"]|join("")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].certificate // []|join(" ")]|join("|")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].key // []|join(" ")]|join("|")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tlsSettings.disableSystemRoot // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.httpSettings.host // []|join("|")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.wsSettings.path // .streamSettings.httpSettings.path|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tcpSettings.acceptProxyProtocol // .streamSettings.wsSettings.acceptProxyProtocol // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.wsSettings.headers // {}|to_entries|map("\(.key)=\(.value)")|join("|")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.tcpSettings.headers.type // .streamSettings.kcpSettings.headers.type // .streamSettings.quicSettings.headers.type // "none"|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.quicSettings.security // "none"|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.quicSettings.key|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.dsSettings.abstract // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.dsSettings.padding // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.streamSettings.sockopt.tproxy // "off"|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.sniffing.enabled // false|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.sniffing.destOverride // []|join("|")|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.allocate.strategy // "always"|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.allocate.refresh // 5|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.allocate.concurrency // 3|tostring|. + "^"]|join("") + "`"),
+    ([.inbounds[]|.tag|. + "^"]|join("") + "`")
+    ]|@tsv' "$V2_CONFIG")
+
+    IFS="^" read -r -a inbounds_protocol <<< "$map_protocol"
+    inbounds_count=${#inbounds_protocol[@]}
+    if_null=""
+
+    for((inbounds_i=0;inbounds_i<inbounds_count;inbounds_i++));
+    do
+        if_null="$if_null^"
+    done
+
+    IFS="^" read -r -a inbounds_listen <<< "${map_listen:-$if_null}"
+    IFS="^" read -r -a inbounds_port <<< "${map_port:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_disable_insecure_encryption <<< "${map_settings_disable_insecure_encryption:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_decryption <<< "${map_settings_decryption:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_timeout <<< "${map_settings_timeout:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_allow_transparent <<< "${map_settings_allow_transparent:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_user_level <<< "${map_settings_user_level:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_address <<< "${map_settings_address:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_port <<< "${map_settings_port:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_network <<< "${map_settings_network:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_follow_redirect <<< "${map_settings_follow_redirect:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_default_level <<< "${map_settings_default_level:-$if_null}"
+    IFS="^" read -r -a inbounds_setttings_default_alter_id <<< "${map_settings_default_alter_id:-$if_null}"
+    IFS="^" read -r -a inbounds_settings_detour_to <<< "${map_settings_detour_to:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_network <<< "${map_stream_network:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_security <<< "${map_stream_security:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_server_name <<< "${map_stream_tls_server_name:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_alpn <<< "${map_stream_tls_alpn:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_certificates_usage <<< "${map_stream_tls_certificates_usage:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_certificates_certificate_file <<< "${map_stream_tls_certificates_certificate_file:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_certificates_key_file <<< "${map_stream_tls_certificates_key_file:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_certificates_certificate <<< "${map_stream_tls_certificates_certificate:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_certificates_key <<< "${map_stream_tls_certificates_key:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tls_disable_system_root <<< "${map_stream_tls_disable_system_root:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_http_host <<< "${map_stream_http_host:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_path <<< "${map_stream_path:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_accept_proxy_protocol <<< "${map_stream_accept_proxy_protocol:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_ws_headers <<< "${map_stream_ws_headers:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_header_type <<< "${map_stream_header_type:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_quic_security <<< "${map_stream_quic_security:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_quic_key <<< "${map_stream_quic_key:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_ds_abstract <<< "${map_stream_ds_abstract:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_ds_padding <<< "${map_stream_ds_padding:-$if_null}"
+    IFS="^" read -r -a inbounds_stream_tproxy <<< "${map_stream_tproxy:-$if_null}"
+    IFS="^" read -r -a inbounds_sniffing_enabled <<< "${map_sniffing_enabled:-$if_null}"
+    IFS="^" read -r -a inbounds_sniffing_dest_override <<< "${map_sniffing_dest_override:-$if_null}"
+    IFS="^" read -r -a inbounds_allocate_strategy <<< "${map_allocate_strategy:-$if_null}"
+    IFS="^" read -r -a inbounds_allocate_refresh <<< "${map_allocate_refresh:-$if_null}"
+    IFS="^" read -r -a inbounds_allocate_concurrency <<< "${map_allocate_concurrency:-$if_null}"
+    IFS="^" read -r -a inbounds_tag <<< "${map_tag:-$if_null}"
+
+    inbounds_nginx_count=0
+    inbounds_nginx_index=()
+    inbounds_other_count=0
+    inbounds_other_index=()
+
+    for((inbounds_i=0;inbounds_i<inbounds_count;inbounds_i++));
+    do
+        if [ "${inbounds_tag[inbounds_i]:0:6}" == "nginx-" ]
+        then
+            inbounds_nginx_count=$((inbounds_nginx_count+1))
+            inbounds_nginx_index+=("$inbounds_i")
+        else
+            inbounds_other_count=$((inbounds_other_count+1))
+            inbounds_other_index+=("$inbounds_i")
+        fi
+    done
+}
+
+V2rayListInbounds()
+{
+    V2rayGetInbounds
+
+    if [ "${1:-}" == "nginx" ] 
     then
-        security="none"
+        list_inbounds_option="本地 nginx 入站"
+        count=$inbounds_nginx_count
+    else
+        echo
+        list_inbounds_options=( '全部入站' '本地 nginx 入站' '其它入站' )
+        inquirer list_input "选择显示的范围" list_inbounds_options list_inbounds_option
+
+        if [ "$list_inbounds_option" == "全部入站" ] 
+        then
+            count=$inbounds_count
+        elif [ "$list_inbounds_option" == "其它入站" ] 
+        then
+            count=$((inbounds_count-inbounds_nginx_count))
+        else
+            count=$inbounds_nginx_count
+        fi
     fi
-    if [ "$security" == "tls" ] 
+
+    [ "$count" -eq 0 ] && Println "$error 没有入站\n" && exit 1
+
+    Println "\n=== $list_inbounds_option数 $green $count ${normal}"
+
+    inbounds_list=""
+
+    for((i=0;i<count;i++));
+    do
+        if [ "$list_inbounds_option" == "全部入站" ] 
+        then
+            inbounds_index=$i
+        elif [ "$list_inbounds_option" == "本地 nginx 入站" ] 
+        then
+            inbounds_index=${inbounds_nginx_index[i]}
+        else
+            inbounds_index=${inbounds_other_index[i]}
+        fi
+        if [ "${inbounds_stream_network[inbounds_index]}" != "domainsocket" ] 
+        then
+            protocol_settings_list="监听地址: $green${inbounds_listen[inbounds_index]}${normal} 监听端口: $green${inbounds_port[inbounds_index]}${normal}\n\033[6C传输协议: $green${inbounds_protocol[inbounds_index]}${normal}\n\033[6C"
+        else
+            protocol_settings_list="传输协议: $green${inbounds_protocol[inbounds_index]}${normal}\n\033[6C"
+        fi
+        if [ "${inbounds_sniffing_enabled[inbounds_index]}" == "true" ] 
+        then
+            protocol_settings_list="$protocol_settings_list流量探测: $green开启${normal} 指定流量类型: $green${inbounds_sniffing_dest_override[inbounds_index]//|/,}${normal}\n\033[6C"
+        fi
+        if [ "${inbounds_allocate_strategy[inbounds_index]}" == "random" ] 
+        then
+            protocol_settings_list="$protocol_settings_list随机端口: $green开启${normal} 刷新间隔: $green${inbounds_allocate_refresh[inbounds_index]} 分钟${normal} 随机端口数量: $green${inbounds_allocate_concurrency[inbounds_index]}${normal}\n\033[6C"
+        fi
+        if [ "${inbounds_protocol[inbounds_index]}" == "vmess" ] 
+        then
+            if [ "${inbounds_settings_disable_insecure_encryption[inbounds_index]}" == "false" ] 
+            then
+                protocol_settings_list="$protocol_settings_list禁止不安全加密: $red否${normal}\n\033[6C"
+            else
+                protocol_settings_list="$protocol_settings_list禁止不安全加密: $green是${normal}\n\033[6C"
+            fi
+            if [ -n "${inbounds_settings_detour_to[inbounds_index]}" ] 
+            then
+                protocol_settings_list="$protocol_settings_list指定的另一个入站: $green${inbounds_settings_detour_to[inbounds_index]}${normal} 默认等级: $green${inbounds_settings_default_level[inbounds_index]}${normal} 默认 alterId: $green${inbounds_setttings_default_alter_id[inbounds_index]}${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_protocol[inbounds_index]}" == "vless" ] 
+        then
+            if [ "${inbounds_settings_decryption[inbounds_index]}" == "none" ] 
+            then
+                protocol_settings_list="$protocol_settings_list解密协议: $red否${normal}\n\033[6C"
+            else
+                protocol_settings_list="$protocol_settings_list解密协议: $green${inbounds_settings_decryption[inbounds_index]}${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_protocol[inbounds_index]}" == "http" ] 
+        then
+            protocol_settings_list="$protocol_settings_list入站数据时间限制: $green${inbounds_settings_timeout[inbounds_index]}${normal}\n\033[6C"
+            if [ -n "${inbounds_settings_user_level[inbounds_index]}" ] 
+            then
+                protocol_settings_list="$protocol_settings_list连接使用等级: $green${inbounds_settings_user_level[inbounds_index]}${normal}\n\033[6C"
+            fi
+            if [ "${inbounds_settings_allow_transparent[inbounds_index]}" == "false" ] 
+            then
+                protocol_settings_list="$protocol_settings_list转发所有请求: $red否${normal}\n\033[6C"
+            else
+                protocol_settings_list="$protocol_settings_list转发所有请求: $green是${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_protocol[inbounds_index]}" == "dokodemo-door" ] 
+        then
+            protocol_settings_list="$protocol_settings_list可接收的网络协议类型: $green${inbounds_settings_network[inbounds_index]}${normal} 入站数据时间限制: $green${inbounds_settings_timeout[inbounds_index]}${normal}\n\033[6C"
+            if [ -n "${inbounds_settings_user_level[inbounds_index]}" ] 
+            then
+                protocol_settings_list="$protocol_settings_list连接使用等级: $green${inbounds_settings_user_level[inbounds_index]}${normal}\n\033[6C"
+            fi
+            if [ "${inbounds_settings_follow_redirect[inbounds_index]}" == "false" ] 
+            then
+                protocol_settings_list="$protocol_settings_list转发防火墙: $red否${normal}\n\033[6C"
+            else
+                protocol_settings_list="$protocol_settings_list转发防火墙: $green是${normal} 目标地址: $green${inbounds_settings_address[inbounds_index]}${normal} 目标端口: $green${inbounds_settings_port[inbounds_index]}${normal}\n\033[6C"
+            fi
+        fi
+        if [ "${inbounds_stream_network[inbounds_index]}" == "http" ] 
+        then
+            stream_settings_list="传输方式: ${green}http/2${normal}\n\033[6C"
+        else
+            stream_settings_list="传输方式: $green${inbounds_stream_network[inbounds_index]}${normal}\n\033[6C"
+        fi
+        if [ "${inbounds_stream_security[inbounds_index]}" == "none" ] 
+        then
+            stream_settings_list="${stream_settings_list}TLS 加密: $red否${normal}\n\033[6C"
+        else
+            stream_settings_list="${stream_settings_list}TLS 加密: $green是${normal}\n\033[6C"
+            if [ -n "${inbounds_stream_tls_server_name[inbounds_index]}" ] 
+            then
+                stream_settings_list="${stream_settings_list}指定证书域名: $green${inbounds_stream_tls_server_name[inbounds_index]}${normal}\n\033[6C"
+            else
+                stream_settings_list="${stream_settings_list}指定证书域名: $red否${normal}\n\033[6C"
+            fi
+            if [ "${inbounds_stream_tls_disable_system_root[inbounds_index]}" == "false" ] 
+            then
+                stream_settings_list="${stream_settings_list}禁用操作系统自带 CA 证书: $red否${normal}\n\033[6C"
+            else
+                stream_settings_list="${stream_settings_list}禁用操作系统自带 CA 证书: $green是${normal}\n\033[6C"
+            fi
+            if [ -n "${inbounds_stream_tls_alpn[inbounds_index]}" ] 
+            then
+                stream_settings_list="${stream_settings_list}TLS 握手 ALPN: $green${inbounds_stream_tls_alpn[inbounds_index]}${normal}\n\033[6C"
+            else
+                stream_settings_list="${stream_settings_list}TLS 握手 ALPN: ${green}h2,http/1.1${normal}\n\033[6C"
+            fi
+            if [ -n "${inbounds_stream_tls_certificates_usage[inbounds_index]}" ] 
+            then
+                certificates_list="$green证书:${normal}\n\033[6C"
+                IFS="|" read -r -a usages <<< "${inbounds_stream_tls_certificates_usage[inbounds_index]}"
+                IFS="|" read -r -a certificate_files <<< "${inbounds_stream_tls_certificates_certificate_file[inbounds_index]}"
+                IFS="|" read -r -a key_files <<< "${inbounds_stream_tls_certificates_key_file[inbounds_index]}"
+                IFS="|" read -r -a certificates <<< "${inbounds_stream_tls_certificates_certificate[inbounds_index]}"
+                for((certificate_i=0;certificate_i<${#usages[@]};certificate_i++));
+                do
+                    if [ -n "${certificates:-}" ] && [ -n "${certificates[certificate_i]}" ] 
+                    then
+                        certificates_list="$certificates_list$((certificate_i+1)). 用途: $green${usages[certificate_i]} [自签名]${normal}\n\033[6C"
+                    else
+                        certificates_list="$certificates_list$((certificate_i+1)). 用途: $green${usages[certificate_i]}${normal}\n\033[6C"
+                    fi
+                    if [ -n "${certificate_files[certificate_i]}" ] 
+                    then
+                        certificates_list="$certificates_list证书路径: $green${certificate_files[certificate_i]}${normal}\n\033[6C"
+                    fi
+                    if [ -n "${key_files[certificate_i]}" ] 
+                    then
+                        certificates_list="$certificates_list密钥路径: $green${key_files[certificate_i]}${normal}\n\033[6C"
+                    fi
+                done
+                stream_settings_list="$stream_settings_list\n\033[6C$certificates_list\n\033[6C"
+            fi
+        fi
+        if [ "${inbounds_stream_tproxy[inbounds_index]}" == "off" ] 
+        then
+            stream_settings_list="$stream_settings_list透明代理: $red否${normal}\n\033[6C"
+        else
+            stream_settings_list="$stream_settings_list透明代理: $green${inbounds_stream_tproxy[inbounds_index]}${normal}\n\033[6C"
+        fi
+        if [ "${inbounds_stream_network[inbounds_index]}" == "ws" ] 
+        then
+            stream_settings_list="$stream_settings_list路径: $green${inbounds_stream_path[inbounds_index]}${normal}\n\033[6C"
+            if [ "${inbounds_stream_accept_proxy_protocol[inbounds_index]}" == "false" ] 
+            then
+                stream_settings_list="$stream_settings_list接收 PROXY 协议: $red否${normal}\n\033[6C"
+            else
+                stream_settings_list="$stream_settings_list接收 PROXY 协议: $green是${normal}\n\033[6C"
+            fi
+            if [ -n "${inbounds_stream_ws_headers[inbounds_index]}" ] 
+            then
+                IFS="|" read -r headers <<< "${inbounds_stream_ws_headers[inbounds_index]}"
+                headers_list=""
+                for header in "${headers[@]}"
+                do
+                    headers_list="$headers_list$green${header%%=*}${normal}: $green${header#*=}${normal}\n\033[6C"
+                done
+                [ -n "$headers_list" ] && stream_settings_list="$stream_settings_list自定义 HTTP 头:\n\033[6C$headers_list"
+            fi
+        elif [ "${inbounds_stream_network[inbounds_index]}" == "tcp" ] 
+        then
+            if [ "${inbounds_stream_accept_proxy_protocol[inbounds_index]}" == "false" ] 
+            then
+                stream_settings_list="$stream_settings_list接收 PROXY 协议: $red否${normal}\n\033[6C"
+            else
+                stream_settings_list="$stream_settings_list接收 PROXY 协议: $green是${normal}\n\033[6C"
+            fi
+            if [ "${inbounds_stream_header_type[inbounds_index]}" == "none" ] 
+            then
+                stream_settings_list="$stream_settings_list数据包头部伪装: $red否${normal}\n\033[6C"
+            else
+                stream_settings_list="$stream_settings_list数据包头部伪装: $green${inbounds_stream_header_type[inbounds_index]}${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_stream_network[inbounds_index]}" == "kcp" ] 
+        then
+            if [ "${inbounds_stream_header_type[inbounds_index]}" == "none" ] 
+            then
+                stream_settings_list="$stream_settings_list数据包头部伪装: $red否${normal}\n\033[6C"
+            else
+                stream_settings_list="$stream_settings_list数据包头部伪装: $green${inbounds_stream_header_type[inbounds_index]}${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_stream_network[inbounds_index]}" == "http" ] 
+        then
+            stream_settings_list="$stream_settings_list路径: $green${inbounds_stream_path[inbounds_index]}${normal}\n\033[6C"
+            if [ -n "${inbounds_stream_http_host[inbounds_index]}" ] 
+            then
+                stream_settings_list="$stream_settings_list通信域名: $green${inbounds_stream_http_host[inbounds_index]//|/, }${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_stream_network[inbounds_index]}" == "quic" ] 
+        then
+            if [ "${inbounds_stream_quic_security[inbounds_index]}" == "none" ] 
+            then
+                stream_settings_list="$stream_settings_list数据包加密方式: $green不加密${normal} 密钥: $green${inbounds_stream_quic_key[inbounds_index]}${normal}\n\033[6C"
+            else
+                stream_settings_list="$stream_settings_list数据包加密方式: $green${inbounds_stream_quic_security[inbounds_index]}${normal} 密钥: $green${inbounds_stream_quic_key[inbounds_index]}${normal}\n\033[6C"
+            fi
+            if [ "${inbounds_stream_header_type[inbounds_index]}" == "none" ] 
+            then
+                stream_settings_list="$stream_settings_list数据包头部伪装: $red否${normal}\n\033[6C"
+            else
+                stream_settings_list="$stream_settings_list数据包头部伪装: $green${inbounds_stream_header_type[inbounds_index]}${normal}\n\033[6C"
+            fi
+        elif [ "${inbounds_stream_network[inbounds_index]}" == "domainsocket" ] 
+        then
+            stream_settings_list="$stream_settings_list文件路径: $green${inbounds_stream_path[inbounds_index]}${normal} abstract: $green${inbounds_stream_ds_abstract[inbounds_index]}${normal} padding: $green${inbounds_stream_ds_padding[inbounds_index]}${normal}\n\033[6C"
+        fi
+        inbounds_list=$inbounds_list"# $green$((i+1))${normal}\r\033[6C标签: $green${inbounds_tag[inbounds_index]:-无}${normal}\n\033[6C$protocol_settings_list$stream_settings_list\n\n"
+    done
+
+    Println "$inbounds_list\n"
+}
+
+V2raySelectInbound()
+{
+    echo "选择入站"
+    while read -p "(默认: 取消): " inbound_num
+    do
+        case "$inbound_num" in
+            "")
+                Println "已取消...\n" && exit 1
+            ;;
+            *[!0-9]*)
+                Println "$error 请输入正确的序号\n"
+            ;;
+            *)
+                if [ "$inbound_num" -gt 0 ] && [ "$inbound_num" -le $count ]
+                then
+                    inbound_num=$((inbound_num-1))
+                    if [ "$list_inbounds_option" == "全部入站" ] 
+                    then
+                        inbounds_index=$inbound_num
+                    elif [ "$list_inbounds_option" == "本地 nginx 入站" ] 
+                    then
+                        inbounds_index=${inbounds_nginx_index[inbound_num]}
+                    else
+                        inbounds_index=${inbounds_other_index[inbound_num]}
+                    fi
+                    break
+                else
+                    Println "$error 请输入正确的序号\n"
+                fi
+            ;;
+        esac
+    done
+}
+
+V2rayDeleteInbound()
+{
+    V2rayListInbounds
+    V2raySelectInbound
+    jq_path='["inbounds"]'
+    JQ delete "$V2_CONFIG" "$inbounds_index"
+    Println "$info 入站 ${inbounds_tag[inbounds_index]} 删除成功\n"
+}
+
+V2rayAddInboundAccount()
+{
+    V2rayListInbounds
+    V2raySelectInbound
+
+    if [ "${inbounds_protocol[inbounds_index]}" == "vmess" ] 
     then
-        V2raySetAllowInsecure
+        V2raySetId
+        V2raySetLevel
+        V2raySetAlterId
+        V2raySetEmail
+        jq_path='["inbounds",'"$inbounds_index"',"settings","clients"]'
+        new_account=$(
+        $JQ_FILE -n --arg id "$id" --arg level "$level" \
+            --arg alterId "$alter_id" --arg email "$email" \
+        '{
+            "id": $id,
+            "level": $level | tonumber,
+            "alterId": $alterId | tonumber,
+            "email": $email
+        }')
+    elif [ "${inbounds_protocol[inbounds_index]}" == "vless" ] 
+    then
+        V2raySetId
+        V2raySetLevel
+        V2raySetEmail
+        jq_path='["inbounds",'"$inbounds_index"',"settings","clients"]'
+        new_account=$(
+        $JQ_FILE -n --arg id "$id" --arg level "$level" \
+            --arg email "$email" \
+        '{
+            "id": $id,
+            "level": $level | tonumber,
+            "email": $email
+        }')
+    elif [ "${inbounds_protocol[inbounds_index]}" == "http" ] 
+    then
+        V2raySetHttpAccount
+        jq_path='["inbounds",'"$inbounds_index"',"settings","accounts"]'
+        new_account=$(
+        $JQ_FILE -n --arg user "$user" --arg pass "$pass" \
+        '{
+            "user": $user,
+            "pass": $pass
+        }')
+    elif [ "${inbounds_protocol[inbounds_index]}" == "dokodemo-door" ] 
+    then
+        Println "$error 无法添加账号到任意门协议\n"
+        exit 1
+    fi
+
+    JQ add "$V2_CONFIG" "[$new_account]"
+    Println "$info 入站账号添加成功\n"
+}
+
+V2rayListInboundAccounts()
+{
+    V2rayListInbounds
+    V2raySelectInbound
+
+    if [ "${inbounds_protocol[inbounds_index]}" == "dokodemo-door" ] 
+    then
+        Println "$error 任意门协议没有账号\n"
+        exit 1
+    fi
+
+    accounts_count=0
+    accounts_list=""
+    while IFS="=" read -r map_id map_level map_alter_id map_email map_user map_pass
+    do
+        accounts_count=$((accounts_count+1))
+        if [ -n "$map_user" ] 
+        then
+            accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C传输协议: ${green}HTTP${normal} 用户名: $green$map_user${normal} 密码: $green$map_pass${normal}\n\n"
+        elif [ -z "$map_alter_id" ] 
+        then
+            accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C传输协议: ${green}VLESS${normal} ID: $green$map_id${normal} 等级: $green$map_level${normal} 邮箱: $green$map_email${normal}\n\n"
+        else
+            accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C传输协议: ${green}VMESS${normal} ID: $green$map_id${normal} 等级: $green$map_level${normal} alterId: $green$map_alter_id${normal} 邮箱: $green$map_email${normal}\n\n"
+        fi
+    done < <($JQ_FILE -r '.inbounds['"$inbounds_index"'].settings | (.clients // .accounts)[] | [.id,.level,.alterId,.email,.user,.pass] | join("=")' "$V2_CONFIG")
+
+    if [ "${inbounds_tag[inbounds_index]:0:6}" == "nginx-" ] 
+    then
+        V2rayListDomainsInbound
+    fi
+
+    if [ -n "$accounts_list" ] 
+    then
+        echo "可用账号:"
+        Println "$accounts_list\n"
+    else
+        Println "$error 此入站没有账号\n"
+        exit 1
     fi
 }
 
-V2raySetOutboundWsSettings()
+V2rayDeleteInboundAccount()
 {
-    echo
-    inquirer text_input "输入 ws 路径: " ws_path "不设置"
-    if [ "$ws_path" == "不设置" ]
+    V2rayListInboundAccounts
+
+    echo "输入序号"
+    while read -p "(默认: 取消): " accounts_index
+    do
+        case "$accounts_index" in
+            "")
+                Println "已取消...\n" && exit 1
+            ;;
+            *[!0-9]*)
+                Println "$error 请输入正确的序号\n"
+            ;;
+            *)
+                if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+1)) ]
+                then
+                    accounts_index=$((accounts_index-1))
+                    break
+                else
+                    Println "$error 请输入正确的序号\n"
+                fi
+            ;;
+        esac
+    done
+
+    if [ "${inbounds_protocol[inbounds_index]}" == "http" ] 
     then
-        ws_path=""
+        group_name="accounts"
+    else
+        group_name="clients"
     fi
-    echo
-    inquirer text_input "输入 ws host header: " ws_host_header "不设置"
-    if [ "$ws_host_header" == "不设置" ]
+
+    if [ "$accounts_index" == "$accounts_count" ] 
     then
-        ws_host_header=""
+        jq_path='["inbounds",'"$inbounds_index"',"settings","'"$group_name"'"]'
+        JQ replace "$V2_CONFIG" "[]"
+    else
+        jq_path='["inbounds",'"$inbounds_index"',"settings","'"$group_name"'"]'
+        JQ delete "$V2_CONFIG" "$accounts_index"
     fi
+    Println "$info 入站账号删除成功\n"
 }
 
 V2rayAddOutbound()
 {
+    V2raySetOutboundProtocol
     V2raySetTag
-    V2raySetProtocol
 
-    echo
-    yn_options=( '否' '是' )
-    inquirer list_input "是否是前置代理" yn_options forward_proxy_yn
+    new_outbound=$(
+    $JQ_FILE -n --arg protocol "$protocol" --arg tag "$tag" \
+    '{
+        "protocol": $protocol,
+        "tag": $tag
+    }')
 
-    if [[ $forward_proxy_yn == "是" ]]
+    if [ "$protocol" != "blackhole" ]
     then
-        echo
-        inquirer list_input "是否是 https 前置代理" yn_options forward_proxy_https_yn
+        V2raySetSendThrough
+        new_outbound=$(
+        $JQ_FILE --arg sendThrough "$send_through" \
+        '. * 
+        {
+            "sendThrough": $sendThrough,
+        }' <<< "$new_outbound")
+    fi
 
-        if [[ $forward_proxy_https_yn == "是" ]] 
-        then
-            V2raySetAllowInsecure
-            new_outbound=$(
-            $JQ_FILE -n --arg protocol "$protocol" --arg tag "$tag" --arg allowInsecure "$allow_insecure" \
-            '{
-                "protocol": $protocol,
-                "settings": {
-                    "servers": []
-                },
-                "streamSettings": {
-                    "security": "tls",
-                    "tlsSettings": {
-                    "allowInsecure": $allowInsecure | test("true")
-                    }
-                },
-                "tag": $tag
-            }')
-        else
-            new_outbound=$(
-            $JQ_FILE -n --arg protocol "$protocol" --arg tag "$tag" \
-            '{
-                "protocol": $protocol,
-                "settings": {
-                    "servers": []
-                },
-                "tag": $tag
-            }')
-        fi
-
-        while true 
-        do
-            new_outbound_proxy_tag=$(GetFreeTag)
-            [ "$new_outbound_proxy_tag" != "$tag" ] && break
-        done
-
-        new_outbound_proxy=$(
-        $JQ_FILE -n --arg proxy_tag "$tag" --arg tag "$new_outbound_proxy_tag" \
-        '{
-            "protocol": "vmess",
-            "settings": {
-                "vnext": []
-            },
-            "proxySettings": {
-                "tag": $proxy_tag  
+    if [ "$protocol" != "blackhole" ] && [ "$protocol" != "dns" ]
+    then
+        V2raySetMuxEnabled
+        V2raySetMuxConcurrency
+        new_outbound=$(
+        $JQ_FILE --arg enabled "$mux_enabled" --arg concurrency "$mux_concurrency" \
+        '. * 
+        {
+            "mux": {
+                "enabled": $enabled | test("true"),
+                "concurrency": $concurrency | tonumber
             }
-            "tag": $tag
-        }')
-        JQ add "$V2_CONFIG" outbounds "[$new_outbound_proxy]"
-    elif [ "$protocol" == "vmess" ] 
+        }' <<< "$new_outbound")
+    fi
+
+    if [ "$protocol" == "vmess" ] || [ "$protocol" == "vless" ]
     then
-        V2raySetStreamSettings
-        V2raySetStreamNetwork
+        V2raySetAddress
+        V2raySetAddressPort
+        new_outbound=$(
+        $JQ_FILE --arg address "$address" --arg port "$address_port" \
+        '. * 
+        {
+            "settings": { 
+                "vnext" : [
+                    {
+                        "address": $address,
+                        "port": $port | tonumber,
+                        "users": []
+                    }
+                ]
+            }
+        }' <<< "$new_outbound")
+    elif [ "$protocol" == "http" ] 
+    then
+        V2raySetAddress
+        V2raySetAddressPort
+        new_outbound=$(
+        $JQ_FILE --arg address "$address" --arg port "$address_port" \
+        '. * 
+        {
+            "settings": { 
+                "servers" : [
+                    {
+                        "address": $address,
+                        "port": $port | tonumber,
+                        "users": []
+                    }
+                ]
+            }
+        }' <<< "$new_outbound")
+    elif [ "$protocol" == "blackhole" ] 
+    then
+        V2raySetResponseType
+        new_outbound=$(
+        $JQ_FILE --arg response_type "$response_type" \
+        '. * 
+        {
+            "settings": {
+                "type": $response_type
+            }
+        }' <<< "$new_outbound")
+    elif [ "$protocol" == "dns" ] 
+    then
+        V2raySetDnsNetwork
+        V2raySetDnsAddress
+        V2raySetDnsPort
+        if [ -n "$dns_network" ] 
+        then
+            new_outbound=$(
+            $JQ_FILE --arg network "$dns_network" \
+            '. * 
+            {
+                "settings": {
+                    "network": $network
+                }
+            }' <<< "$new_outbound")
+        fi
+        if [ -n "$dns_address" ] 
+        then
+            new_outbound=$(
+            $JQ_FILE --arg address "$dns_address" \
+            '. * 
+            {
+                "settings": {
+                    "address": $address
+                }
+            }' <<< "$new_outbound")
+        fi
+        if [ -n "$dns_port" ] 
+        then
+            new_outbound=$(
+            $JQ_FILE --arg port "$dns_port" \
+            '. * 
+            {
+                "settings": {
+                    "port": $port | tonumber
+                }
+            }' <<< "$new_outbound")
+        fi
+    elif [ "$protocol" == "freedom" ] 
+    then
+        V2raySetFreedomDomainStrategy
+        V2raySetFreedomRedirect
+        V2raySetLevel
+        new_outbound=$(
+        $JQ_FILE --arg domainStrategy "$freedom_domain_strategy" --arg userLevel "$level" \
+        '. * 
+        {
+            "settings": {
+                "domainStrategy": $domainStrategy,
+                "userLevel": $userLevel | tonumber
+            }
+        }' <<< "$new_outbound")
+        if [ -n "$freedom_redirect" ] 
+        then
+            new_outbound=$(
+            $JQ_FILE --arg redirect "$freedom_redirect" \
+            '. * 
+            {
+                "settings": {
+                    "redirect": $redirect
+                }
+            }' <<< "$new_outbound")
+        fi
+    fi
+
+    V2raySetProxy
+    if [ -n "$proxy_tag" ] 
+    then
+        new_outbound=$(
+        $JQ_FILE --arg tag "$proxy_tag" \
+        '. * 
+        {
+            "proxySettings": {
+                "tag": $tag
+            }
+        }' <<< "$new_outbound")
+    fi
+
+    if [ -z "$proxy_tag" ] && [ "$protocol" != "blackhole" ] && [ "$protocol" != "dns" ] && [ "$protocol" != "freedom" ]
+    then
+        V2raySetOutboundNetwork
+
+        new_outbound=$(
+        $JQ_FILE --arg network "$network" --arg security "$security" \
+        '. * 
+        {
+            "streamSettings": {
+                "network": $network,
+                "security": $security
+            }
+        }' <<< "$new_outbound")
+
         if [ "$network" == "ws" ] 
         then
-            V2raySetOutboundWsSettings
+            V2raySetPath
+            V2raySetHeaders
             new_outbound=$(
-            $JQ_FILE -n --arg protocol "$protocol" --arg tag "$tag" \
-            --arg path "$ws_path" --arg host "$ws_host_header" \
-            --arg allowInsecure "${allow_insecure:-false}" --arg security "$security" \
-            '{
-                "protocol": $protocol,
+            $JQ_FILE --arg path "$path" --argjson headers "{$headers}" \
+            '. * 
+            {
                 "streamSettings": {
                     "wsSettings": {
                         "path": $path,
-                        "headers": {
-                            "host": $host
-                        }
-                    },
-                    "tlsSettings": {
-                        "allowInsecure": $allowInsecure | test("true")
-                    },
-                    "security": $security,
-                    "network": "ws"
-                },
-                "settings": {
-                    "vnext": []
-                },
-                "tag": $tag
-            }')
-        else
+                        "headers": $headers
+                    }
+                }
+            }' <<< "$new_outbound")
+        elif [ "$network" == "tcp" ] 
+        then
+            V2raySetHeaderType
             new_outbound=$(
-            $JQ_FILE -n --arg protocol "$protocol" --arg tag "$tag" \
-            --arg allowInsecure "${allow_insecure:-false}" --arg security "$security" \
-            '{
-                "protocol": $protocol,
+            $JQ_FILE --arg header_type "$header_type" \
+            '. * 
+            {
+                "streamSettings": {
+                    "tcpSettings": {
+                        "header": {
+                            "type": $header_type
+                        }
+                    }
+                }
+            }' <<< "$new_outbound")
+        elif [ "$network" == "kcp" ] 
+        then
+            V2raySetHeaderType
+            new_outbound=$(
+            $JQ_FILE --arg header_type "$header_type" \
+            '. * 
+            {
+                "streamSettings": {
+                    "kcpSettings": {
+                        "header": {
+                            "type": $header_type
+                        }
+                    }
+                }
+            }' <<< "$new_outbound")
+        elif [ "$network" == "http" ] 
+        then
+            V2raySetHost
+            V2raySetPath
+            new_outbound=$(
+            $JQ_FILE --argjson host "[$host]" \
+                --arg path "$path" \
+            '. * 
+            {
+                "streamSettings": {
+                    "httpSettings": {
+                        "host": $host,
+                        "path": $path
+                    }
+                }
+            }' <<< "$new_outbound")
+        elif [ "$network" == "quic" ] 
+        then
+            V2raySetQuicSecurity
+            V2raySetQuicKey
+            V2raySetHeaderType
+            new_outbound=$(
+            $JQ_FILE --arg security "$quic_security" \
+                --arg key "$quic_key" --arg header_type "$header_type" \
+            '. * 
+            {
+                "streamSettings": {
+                    "quicSettings": {
+                        "security": $security,
+                        "key": $key,
+                        "header": {
+                            "type": $header_type
+                        }
+                    }
+                }
+            }' <<< "$new_outbound")
+        fi
+
+        V2raySetSecurity
+
+        if [ "$security" == "tls" ] 
+        then
+            V2raySetServerName
+            if [ -n "$server_name" ] 
+            then
+                new_outbound=$(
+                $JQ_FILE --arg serverName "$server_name" \
+                '. * 
+                {
+                    "streamSettings": {
+                        "tlsSettings": {
+                            "serverName": $serverName
+                        }
+                    }
+                }' <<< "$new_outbound")
+            fi
+            V2raySetAllowInsecure
+            V2raySetAlpn
+            V2raySetDisableSystemRoot
+            new_outbound=$(
+            $JQ_FILE --arg allowInsecure "$allow_insecure" \
+            --argjson alpn "[$alpn]" --arg disableSystemRoot "$disable_system_root" \
+            '. * 
+            {
                 "streamSettings": {
                     "tlsSettings": {
-                        "allowInsecure": $allowInsecure | test("true")
-                    },
-                    "security": $security,
-                    "network": $network
-                },
-                "settings": {
-                    "vnext": []
-                },
-                "tag": $tag
-            }')
+                        "allowInsecure": $allowInsecure | test("true"),
+                        "alpn": $alpn,
+                        "disableSystemRoot": $disableSystemRoot | test("true"),
+                    }
+                }
+            }' <<< "$new_outbound")
+            while true 
+            do
+                if [ "$disable_system_root" == "false" ] 
+                then
+                    echo
+                    yn_options=( '否' '是' )
+                    inquirer list_input "是否继续添加证书" yn_options continue_yn
+                    if [ "$continue_yn" == "否" ] 
+                    then
+                        break
+                    fi
+                fi
+                Println "$info 设置证书"
+                V2raySetCertificates
+                merge=$(
+                $JQ_FILE -n --argjson certificates "[$certificate]" \
+                '{
+                    "streamSettings": {
+                        "tlsSettings": {
+                            "certificates": $certificates
+                        }
+                    }
+                }')
+                JQs merge new_outbound "$merge"
+                if [ "$disable_system_root" == "true" ] 
+                then
+                    echo
+                    yn_options=( '否' '是' )
+                    inquirer list_input "是否继续添加证书" yn_options continue_yn
+                    if [ "$continue_yn" == "否" ] 
+                    then
+                        break
+                    fi
+                fi
+            done
         fi
-    else
-        new_outbound=$(
-        $JQ_FILE -n --arg protocol "$protocol" --arg tag "$tag" \
-        '{
-            "protocol": $protocol,
-            "settings": {
-                "servers": []
-            },
-            "tag": $tag
-        }')
     fi
 
     JQ add "$V2_CONFIG" outbounds "[$new_outbound]"
 
-    Println "$info 出站转发组添加成功\n"
+    Println "$info 出站 $tag 添加成功\n"
 }
 
-V2rayAddRoutingRules()
+V2rayGetOutbounds()
 {
+    IFS=$'`\t' read -r map_send_through map_protocol map_settings_user_level \
+    map_settings_address map_settings_port map_settings_network map_settings_response_type \
+    map_settings_domain_strategy map_settings_redirect map_stream_network map_stream_security \
+    map_stream_tls_server_name map_stream_tls_allow_insecure map_stream_tls_alpn \
+    map_stream_tls_certificates_usage map_stream_tls_certificates_certificate_file \
+    map_stream_tls_certificates_key_file map_stream_tls_certificates_certificate \
+    map_stream_tls_certificates_key map_stream_tls_disable_system_root \
+    map_stream_http_host map_stream_path map_stream_ws_headers map_stream_header_type \
+    map_stream_quic_security map_stream_quic_key map_proxy_tag map_mux_enabled map_mux_concurrency \
+    map_tag < <($JQ_FILE -r '[
+    ([.outbounds[]|.sendThrough|if . == "" // . == null then "0.0.0.0" else . end|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.protocol|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.userLevel // ""|tostring|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.address // .settings.vnext[0].address // .settings.servers[0].address|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.port // .settings.vnext[0].port // .settings.servers[0].port // ""|tostring|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.network|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.response.type // "none"|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.domainStrategy // "AsIs"|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.settings.redirect|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.network|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.security // "none"|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.serverName|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.allowInsecure // false|tostring|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.alpn // []|join("|")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].usage|. + "|"]|join("")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].certificateFile|. + "|"]|join("")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].keyFile|. + "|"]|join("")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].certificate // []|join(" ")]|join("|")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.certificates // []|[.[].key // []|join(" ")]|join("|")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tlsSettings.disableSystemRoot // false|tostring|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.httpSettings.host // []|join("|")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.wsSettings.path // .streamSettings.httpSettings.path|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.wsSettings.headers // {}|to_entries|map("\(.key)=\(.value)")|join("|")|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.tcpSettings.headers.type // .streamSettings.kcpSettings.headers.type // .streamSettings.quicSettings.headers.type // "none"|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.quicSettings.security // "none"|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.streamSettings.quicSettings.key|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.proxySettings.tag|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.mux.enabled // false|tostring|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.mux.concurrency // 8|tostring|. + "^"]|join("") + "`"),
+    ([.outbounds[]|.tag|. + "^"]|join("") + "`")
+    ]|@tsv' "$V2_CONFIG")
+
+    IFS="^" read -r -a outbounds_protocol <<< "$map_protocol"
+    outbounds_count=${#outbounds_protocol[@]}
+    if_null=""
+
+    for((outbounds_i=0;outbounds_i<outbounds_count;outbounds_i++));
+    do
+        if_null="$if_null^"
+    done
+
+    IFS="^" read -r -a outbounds_send_through <<< "${map_send_through:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_user_level <<< "${map_settings_user_level:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_address <<< "${map_settings_address:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_port <<< "${map_settings_port:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_network <<< "${map_settings_network:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_response_type <<< "${map_settings_response_type:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_domain_strategy <<< "${map_settings_domain_strategy:-$if_null}"
+    IFS="^" read -r -a outbounds_settings_redirect <<< "${map_settings_redirect:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_network <<< "${map_stream_network:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_security <<< "${map_stream_security:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_server_name <<< "${map_stream_tls_server_name:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_allow_insecure <<< "${map_stream_tls_allow_insecure:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_alpn <<< "${map_stream_tls_alpn:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_certificates_usage <<< "${map_stream_tls_certificates_usage:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_certificates_certificate_file <<< "${map_stream_tls_certificates_certificate_file:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_certificates_key_file <<< "${map_stream_tls_certificates_key_file:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_certificates_certificate <<< "${map_stream_tls_certificates_certificate:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_certificates_key <<< "${map_stream_tls_certificates_key:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_tls_disable_system_root <<< "${map_stream_tls_disable_system_root:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_http_host <<< "${map_stream_http_host:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_path <<< "${map_stream_path:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_ws_headers <<< "${map_stream_ws_headers:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_header_type <<< "${map_stream_header_type:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_quic_security <<< "${map_stream_quic_security:-$if_null}"
+    IFS="^" read -r -a outbounds_stream_quic_key <<< "${map_stream_quic_key:-$if_null}"
+    IFS="^" read -r -a outbounds_proxy_tag <<< "${map_proxy_tag:-$if_null}"
+    IFS="^" read -r -a outbounds_mux_enabled <<< "${map_mux_enabled:-$if_null}"
+    IFS="^" read -r -a outbounds_mux_concurrency <<< "${map_mux_concurrency:-$if_null}"
+    IFS="^" read -r -a outbounds_tag <<< "${map_tag:-$if_null}"
+}
+
+V2rayListOutbounds()
+{
+    V2rayGetOutbounds
+
+    [ "$outbounds_count" -eq 0 ] && Println "$error 没有出站\n" && exit 1
+
+    Println "\n=== 出站数 $green $outbounds_count ${normal}"
+
+    outbounds_list=""
+
+    for((outbounds_index=0;outbounds_index<outbounds_count;outbounds_index++));
+    do
+        protocol_settings_list="传输协议: $green${outbounds_protocol[outbounds_index]}${normal}\n\033[6C"
+        if [ "${outbounds_send_through[outbounds_index]}" != "0.0.0.0" ] 
+        then
+            protocol_settings_list="$protocol_settings_list发送数据的 IP 地址: $green${outbounds_send_through[outbounds_index]}${normal}\n\033[6C"
+        fi
+        if [ -n "${outbounds_settings_address[outbounds_index]}" ] 
+        then
+            protocol_settings_list="$protocol_settings_list目标地址: $green${outbounds_settings_address[outbounds_index]}${normal} 目标端口: $green${outbounds_settings_port[outbounds_index]}${normal}\n\033[6C"
+        fi
+        if [ "${outbounds_protocol[outbounds_index]}" == "blackhole" ] 
+        then
+            if [ "${outbounds_settings_response_type[outbounds_index]}" == "none" ] 
+            then
+                protocol_settings_list="$protocol_settings_list黑洞的响应方式: $green直接关闭${normal}\n\033[6C"
+            else
+                protocol_settings_list="$protocol_settings_list黑洞的响应方式: $green返回403并关闭${normal}\n\033[6C"
+            fi
+        elif [ "${outbounds_protocol[outbounds_index]}" == "dns" ] 
+        then
+            protocol_settings_list="${protocol_settings_list}传输层协议: $green${outbounds_settings_network[outbounds_index]:-不变}${normal} 服务器地址: $green${outbounds_settings_address[outbounds_index]:-不变}${normal} 服务器端口: $green${outbounds_settings_port[outbounds_index]:-不变}${normal}\n\033[6C"
+        elif [ "${outbounds_protocol[outbounds_index]}" == "freedom" ] 
+        then
+            if [ -n "${outbounds_settings_domain_strategy[outbounds_index]}" ] 
+            then
+                protocol_settings_list="$protocol_settings_list域名策略: $green${outbounds_settings_domain_strategy[outbounds_index]}${normal}\n\033[6C"
+            fi
+            if [ -n "${outbounds_settings_redirect[outbounds_index]}" ] 
+            then
+                protocol_settings_list="$protocol_settings_list发送到指定地址: $green${outbounds_settings_redirect[outbounds_index]}${normal}\n\033[6C"
+            fi
+            if [ -n "${outbounds_settings_user_level[outbounds_index]}" ] 
+            then
+                protocol_settings_list="$protocol_settings_list使用用户等级: $green${outbounds_settings_user_level[outbounds_index]}${normal}\n\033[6C"
+            fi
+        fi
+        if [ -n "${outbounds_proxy_tag[outbounds_index]}" ] 
+        then
+            stream_settings_list="指定的出站代理标签: ${outbounds_proxy_tag[outbounds_index]}\n\033[6C"
+        else
+            stream_settings_list=""
+            if [ "${outbounds_stream_network[outbounds_index]}" == "http" ] 
+            then
+                stream_settings_list="传输方式: ${green}http/2${normal}\n\033[6C"
+            elif [ -n "${outbounds_stream_network[outbounds_index]}" ]  
+            then
+                stream_settings_list="传输方式: $green${outbounds_stream_network[outbounds_index]}${normal}\n\033[6C"
+            fi
+            if [ "${outbounds_protocol[outbounds_index]}" != "blackhole" ] && [ "${outbounds_protocol[outbounds_index]}" != "dns" ] && [ "${outbounds_protocol[outbounds_index]}" != "freedom" ]
+            then
+                if [ "${outbounds_stream_security[outbounds_index]}" == "none" ] 
+                then
+                    stream_settings_list="${stream_settings_list}TLS 加密: $red否${normal}\n\033[6C"
+                else
+                    stream_settings_list="${stream_settings_list}TLS 加密: $green是${normal}\n\033[6C"
+                    if [ -n "${outbounds_stream_tls_server_name[outbounds_index]}" ] 
+                    then
+                        stream_settings_list="${stream_settings_list}指定证书域名: $green${outbounds_stream_tls_server_name[outbounds_index]}${normal}\n\033[6C"
+                    else
+                        stream_settings_list="${stream_settings_list}指定证书域名: $red否${normal}\n\033[6C"
+                    fi
+                    if [ "${outbounds_stream_tls_allow_insecure[outbounds_index]}" == "false" ] 
+                    then
+                        stream_settings_list="${stream_settings_list}允许不安全连接: $red否${normal}\n\033[6C"
+                    else
+                        stream_settings_list="${stream_settings_list}允许不安全连接: $green是${normal}\n\033[6C"
+                    fi
+                    if [ "${outbounds_stream_tls_disable_system_root[outbounds_index]}" == "false" ] 
+                    then
+                        stream_settings_list="${stream_settings_list}禁用操作系统自带 CA 证书: $red否${normal}\n\033[6C"
+                    else
+                        stream_settings_list="${stream_settings_list}禁用操作系统自带 CA 证书: $green是${normal}\n\033[6C"
+                    fi
+                    if [ -n "${outbounds_stream_tls_alpn[outbounds_index]}" ] 
+                    then
+                        stream_settings_list="${stream_settings_list}TLS 握手 ALPN: $green${outbounds_stream_tls_alpn[outbounds_index]}${normal}\n\033[6C"
+                    else
+                        stream_settings_list="${stream_settings_list}TLS 握手 ALPN: ${green}h2,http/1.1${normal}\n\033[6C"
+                    fi
+                    if [ -n "${outbounds_stream_tls_certificates_usage[outbounds_index]}" ] 
+                    then
+                        certificates_list="$green证书:${normal}\n\033[6C"
+                        IFS="|" read -r -a usages <<< "${outbounds_stream_tls_certificates_usage[outbounds_index]}"
+                        IFS="|" read -r -a certificate_files <<< "${outbounds_stream_tls_certificates_certificate_file[outbounds_index]}"
+                        IFS="|" read -r -a key_files <<< "${outbounds_stream_tls_certificates_key_file[outbounds_index]}"
+                        IFS="|" read -r -a certificates <<< "${outbounds_stream_tls_certificates_certificate[outbounds_index]}"
+                        for((certificate_i=0;certificate_i<${#usages[@]};certificate_i++));
+                        do
+                            if [ -n "${certificates:-}" ] && [ -n "${certificates[certificate_i]}" ] 
+                            then
+                                certificates_list="$certificates_list$((certificate_i+1)). 用途: $green${usages[certificate_i]} [自签名]${normal}\n\033[6C"
+                            else
+                                certificates_list="$certificates_list$((certificate_i+1)). 用途: $green${usages[certificate_i]}${normal}\n\033[6C"
+                            fi
+                            if [ -n "${certificate_files[certificate_i]}" ] 
+                            then
+                                certificates_list="$certificates_list证书路径: $green${certificate_files[certificate_i]}${normal}\n\033[6C"
+                            fi
+                            if [ -n "${key_files[certificate_i]}" ] 
+                            then
+                                certificates_list="$certificates_list密钥路径: $green${key_files[certificate_i]}${normal}\n\033[6C"
+                            fi
+                        done
+                        stream_settings_list="$stream_settings_list\n\033[6C$certificates_list\n\033[6C"
+                    fi
+                fi
+            fi
+            if [ "${outbounds_stream_network[outbounds_index]}" == "ws" ] 
+            then
+                stream_settings_list="$stream_settings_list路径: $green${outbounds_stream_path[outbounds_index]}${normal}\n\033[6C"
+                if [ -n "${outbounds_stream_ws_headers[outbounds_index]}" ] 
+                then
+                    IFS="|" read -r headers <<< "${outbounds_stream_ws_headers[outbounds_index]}"
+                    headers_list=""
+                    for header in "${headers[@]}"
+                    do
+                        headers_list="$headers_list$green${header%%=*}${normal}: $green${header#*=}${normal}\n\033[6C"
+                    done
+                    [ -n "$headers_list" ] && stream_settings_list="$stream_settings_list自定义 HTTP 头:\n\033[6C$headers_list"
+                fi
+            elif [ "${outbounds_stream_network[outbounds_index]}" == "tcp" ] 
+            then
+                if [ "${outbounds_stream_header_type[outbounds_index]}" == "none" ] 
+                then
+                    stream_settings_list="$stream_settings_list数据包头部: $red不伪装${normal}\n\033[6C"
+                else
+                    stream_settings_list="$stream_settings_list数据包头部: ${green}http 伪装${normal}\n\033[6C"
+                fi
+            elif [ "${outbounds_stream_network[outbounds_index]}" == "kcp" ] 
+            then
+                if [ "${outbounds_stream_header_type[outbounds_index]}" == "none" ] 
+                then
+                    stream_settings_list="$stream_settings_list数据包头部: $red不伪装${normal}\n\033[6C"
+                else
+                    stream_settings_list="$stream_settings_list数据包头部: ${green}http 伪装${normal}\n\033[6C"
+                fi
+            elif [ "${outbounds_stream_network[outbounds_index]}" == "http" ] 
+            then
+                stream_settings_list="$stream_settings_list路径: $green${outbounds_stream_path[outbounds_index]}${normal}\n\033[6C"
+                if [ -n "${outbounds_stream_http_host[outbounds_index]}" ] 
+                then
+                    stream_settings_list="$stream_settings_list通信域名: $green${outbounds_stream_http_host[outbounds_index]//|/, }${normal}\n\033[6C"
+                fi
+            elif [ "${outbounds_stream_network[outbounds_index]}" == "quic" ] 
+            then
+                if [ "${outbounds_stream_quic_security[outbounds_index]}" == "none" ] 
+                then
+                    stream_settings_list="$stream_settings_list数据包加密方式: $red不加密${normal} 密钥: $green${outbounds_stream_quic_key[outbounds_index]}${normal}\n\033[6C"
+                else
+                    stream_settings_list="$stream_settings_list数据包加密方式: $green${outbounds_stream_quic_security[outbounds_index]}${normal} 密钥: $green${outbounds_stream_quic_key[outbounds_index]}${normal}\n\033[6C"
+                fi
+                if [ "${outbounds_stream_header_type[outbounds_index]}" == "none" ] 
+                then
+                    stream_settings_list="$stream_settings_list数据包头部: $red不伪装${normal}\n\033[6C"
+                else
+                    stream_settings_list="$stream_settings_list数据包头部: ${green}http 伪装${normal}\n\033[6C"
+                fi
+            fi
+        fi
+        if [ "${outbounds_mux_enabled[outbounds_index]}" == "true" ] 
+        then
+            mux_settings_list="$green已开启 Mux${normal} 最大并发连接数: $green${outbounds_mux_concurrency[outbounds_index]}${normal}\n\033[6C"
+        else
+            mux_settings_list=""
+        fi
+        outbounds_list=$outbounds_list"# $green$((outbounds_index+1))${normal}\r\033[6C标签: $green${outbounds_tag[outbounds_index]:-无}${normal}\n\033[6C$protocol_settings_list$stream_settings_list$mux_settings_list\n\n"
+    done
+
+    Println "$outbounds_list\n"
+}
+
+V2raySelectOutbound()
+{
+    echo -e "选择出站"
+    while read -p "(默认: 取消): " outbound_num
+    do
+        case "$outbound_num" in
+            "")
+                Println "已取消...\n" && exit 1
+            ;;
+            *[!0-9]*)
+                Println "$error 请输入正确的序号\n"
+            ;;
+            *)
+                if [ "$outbound_num" -gt 0 ] && [ "$outbound_num" -le $outbounds_count ]
+                then
+                    outbounds_index=$((outbound_num-1))
+                    break
+                else
+                    Println "$error 请输入正确的序号\n"
+                fi
+            ;;
+        esac
+    done
+}
+
+V2rayDeleteOutbound()
+{
+    V2rayListOutbounds
+    V2raySelectOutbound
+    jq_path='["outbounds"]'
+    JQ delete "$V2_CONFIG" "$outbounds_index"
+    Println "$info 出站 ${outbounds_tag[outbounds_index]} 删除成功\n"
+}
+
+V2rayAddOutboundAccount()
+{
+    V2rayListOutbounds
+    V2raySelectOutbound
+
+    if [ "${outbounds_protocol[outbounds_index]}" == "vmess" ] 
+    then
+        V2raySetId
+        V2raySetAlterId
+        V2raySetVmessSecurity
+        V2raySetLevel
+        jq_path='["outbounds",'"$outbounds_index"',"settings","vnext",0,"users"]'
+        new_account=$(
+        $JQ_FILE -n --arg id "$id" --arg alterId "$alter_id" \
+            --arg security "$vmess_security" --arg level "$level" \
+        '{
+            "id": $id,
+            "alterId": $alterId | tonumber,
+            "security": $security,
+            "level": $level | tonumber
+        }')
+    elif [ "${outbounds_protocol[outbounds_index]}" == "vless" ] 
+    then
+        V2raySetId
+        V2raySetLevel
+        jq_path='["outbounds",'"$outbounds_index"',"settings","vnext",0,"users"]'
+        new_account=$(
+        $JQ_FILE -n --arg id "$id" --arg level "$level" \
+        '{
+            "id": $id,
+            "encryption": "none",
+            "level": $level | tonumber
+        }')
+    elif [ "${outbounds_protocol[outbounds_index]}" == "http" ] 
+    then
+        V2raySetHttpAccount
+        new_account=$(
+        $JQ_FILE -n --arg user "$user" --arg pass "$pass" \
+        '{
+            "user": $user,
+            "pass": $pass
+        }')
+    else
+        Println "$error 无法添加账号到此协议\n"
+        exit 1
+    fi
+
+    JQ add "$V2_CONFIG" "[$new_account]"
+    Println "$info 出站账号添加成功\n"
+}
+
+V2rayListOutboundAccounts()
+{
+    V2rayListOutbounds
+    V2raySelectOutbound
+
+    if [ "${outbounds_protocol[outbounds_index]}" != "vmess" ] && [ "${outbounds_protocol[outbounds_index]}" != "vless" ] && [ "${outbounds_protocol[outbounds_index]}" != "http" ]
+    then
+        Println "$error 协议 ${outbounds_protocol[outbounds_index]} 没有账号\n"
+        exit 1
+    fi
+
+    accounts_count=0
+    accounts_list=""
+    while IFS="=" read -r map_id map_level map_alter_id map_security map_user map_pass
+    do
+        accounts_count=$((accounts_count+1))
+        if [ -n "$map_user" ] 
+        then
+            accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C传输协议: ${green}HTTP${normal} 用户名: $green$map_user${normal} 密码: $green$map_pass${normal}\n\n"
+        elif [ -z "$map_alter_id" ] 
+        then
+            accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C传输协议: ${green}VLESS${normal} ID: $green$map_id${normal} 等级: $green$map_level${normal} 加密方式: $green$map_security${normal}\n\n"
+        else
+            accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C传输协议: ${green}VMESS${normal} ID: $green$map_id${normal} 等级: $green$map_level${normal} alterId: $green$map_alter_id${normal} 加密方式: $green$map_security${normal}\n\n"
+        fi
+    done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings | (.vnext // .servers)[0].users[] | [.id,.level,.alterId,.security,.user,.pass] | join("=")' "$V2_CONFIG")
+
+    if [ -n "$accounts_list" ] 
+    then
+        echo "可用账号:"
+        Println "$accounts_list\n"
+    else
+        Println "$error 此出站没有账号\n"
+        exit 1
+    fi
+}
+
+V2rayDeleteOutboundAccount()
+{
+    V2rayListOutboundAccounts
+
+    accounts_list=$accounts_list"# $green$((accounts_count+1))${normal}\r\033[6C删除所有账号"
+    echo -e "可用账号:\n\n$accounts_list\n"
+    echo "输入序号"
+    while read -p "(默认: 取消): " accounts_index
+    do
+        case "$accounts_index" in
+            "")
+                Println "已取消...\n" && exit 1
+            ;;
+            *[!0-9]*)
+                Println "$error 请输入正确的序号\n"
+            ;;
+            *)
+                if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+1)) ]
+                then
+                    accounts_index=$((accounts_index-1))
+                    break
+                else
+                    Println "$error 请输入正确的序号\n"
+                fi
+            ;;
+        esac
+    done
+
+    if [ "${outbounds_protocol[outbounds_index]}" == "http" ] 
+    then
+        group_name="servers"
+    else
+        group_name="vnext"
+    fi
+
+    if [ "$accounts_index" == "$accounts_count" ] 
+    then
+        jq_path='["outbounds",'"$outbounds_index"',"settings","'"$group_name"'",0,"users"]'
+        JQ replace "$V2_CONFIG" "[]"
+    else
+        jq_path='["outbounds",'"$outbounds_index"',"settings","'"$group_name"'",0,"users"]'
+        JQ delete "$V2_CONFIG" "$accounts_index"
+    fi
+    Println "$info 出站账号删除成功\n"
+}
+
+V2rayGetRouting()
+{
+    IFS=$'`\t' read -r routing_domain_strategy m_rules_type m_rules_domain m_rules_ip m_rules_port \
+    m_rules_source_port m_rules_network m_rules_source m_rules_user m_rules_inbound_tag \
+    m_rules_protocol m_rules_attrs m_rules_outbound_tag m_rules_balancer_tag m_balancers_tag \
+    m_balancers_selector < <($JQ_FILE -r '[
+    (.routing.domainStrategy|if . == "" // . == null then "AsIs" else . end + "`"),
+    ([.routing.rules[]|.type|if . == "" // . == null then "field" else . end|. + "^"]|join("") + "`"),
+    ([(.routing.rules[]|.domain // [] |join("|"))|. + "^"]|join("") + "`"),
+    ([(.routing.rules[]|.ip // [] |join("|"))|. + "^"]|join("") + "`"),
+    ([.routing.rules[]|.port|. + "^"]|join("") + "`"),
+    ([.routing.rules[]|.sourcePort|. + "^"]|join("") + "`"),
+    ([.routing.rules[]|.network|. + "^"]|join("") + "`"),
+    ([(.routing.rules[]|.source // [] |join("|"))|. + "^"]|join("") + "`"),
+    ([(.routing.rules[]|.user // [] |join("|"))|. + "^"]|join("") + "`"),
+    ([(.routing.rules[]|.inboundTag // [] |join("|"))|. + "^"]|join("") + "`"),
+    ([(.routing.rules[]|.protocol // [] |join("|"))|. + "^"]|join("") + "`"),
+    ([.routing.rules[]|.attrs|. + "^"]|join("") + "`"),
+    ([.routing.rules[]|.outboundTag|. + "^"]|join("") + "`"),
+    ([.routing.rules[]|.balancerTag|. + "^"]|join("") + "`"),
+    ([(.routing.balancers // [])[]|.tag|. + "^"]|join("") + "`"),
+    ([((.routing.balancers // [])[]|.selector // [] |join("|"))|. + "^"]|join("") + "`")]|@tsv' "$V2_CONFIG")
+
+    IFS="^" read -r -a routing_rules_type <<< "$m_rules_type"
+    IFS="^" read -r -a routing_rules_domain <<< "$m_rules_domain"
+    IFS="^" read -r -a routing_rules_ip <<< "$m_rules_ip"
+    IFS="^" read -r -a routing_rules_port <<< "$m_rules_port"
+    IFS="^" read -r -a routing_rules_source_port <<< "$m_rules_source_port"
+    IFS="^" read -r -a routing_rules_network <<< "$m_rules_network"
+    IFS="^" read -r -a routing_rules_source <<< "$m_rules_source"
+    IFS="^" read -r -a routing_rules_user <<< "$m_rules_user"
+    IFS="^" read -r -a routing_rules_inbound_tag <<< "$m_rules_inbound_tag"
+    IFS="^" read -r -a routing_rules_protocol <<< "$m_rules_protocol"
+    IFS="^" read -r -a routing_rules_attrs <<< "$m_rules_attrs"
+    IFS="^" read -r -a routing_rules_outbound_tag <<< "$m_rules_outbound_tag"
+    IFS="^" read -r -a routing_rules_balancer_tag <<< "$m_rules_balancer_tag"
+    IFS="^" read -r -a routing_balancers_tag <<< "$m_balancers_tag"
+    IFS="^" read -r -a routing_balancers_selector <<< "$m_balancers_selector"
+
+    if [ -n "${routing_rules_type:-}" ] 
+    then
+        routing_rules_count=${#routing_rules_type[@]}
+    else
+        routing_rules_count=0
+    fi
+
+    if [ -n "${routing_balancers_tag:-}" ] 
+    then
+        routing_balancers_count=${#routing_balancers_tag[@]}
+    else
+        routing_balancers_count=0
+    fi
+}
+
+V2rayListRouting()
+{
+    V2rayGetRouting
+}
+
+V2raySetRoutingDomainStrategy()
+{
+    echo
+    routing_domain_strategy_options=( 'AsIs' 'IPIfNonMatch' 'IPOnDemand' )
+    inquirer list_input "域名解析策略" routing_domain_strategy_options routing_domain_strategy
+    jq_path='["routing","domainStrategy"]'
+    JQ replace "$V2_CONFIG" "$routing_domain_strategy"
+}
+
+V2raySetRoutingRules()
+{
+    V2rayListInbounds
+    V2raySelectInbound
+
+    if [ -z "${inbounds_tag[inbounds_index]}" ] 
+    then
+        Println "$error 此入站没有标签\n"
+        exit 1
+    fi
+
+    V2rayListOutbounds
+    V2raySelectOutbound
+
+    if [ -z "${outbounds_tag[outbounds_index]}" ] 
+    then
+        Println "$error 此出站没有标签\n"
+        exit 1
+    fi
+
     jq_path='["routing","rules"]'
     new_rule=$(
-    $JQ_FILE -n --arg inbound_tag "$inbound_tag" --arg outbound_tag "$outbound_tag" \
+    $JQ_FILE -n --arg inbound_tag "${inbounds_tag[inbounds_index]}" --arg outbound_tag "${outbounds_tag[outbounds_index]}" \
     '{
         "type": "field",
         "inboundTag": [
@@ -23135,756 +24926,67 @@ V2rayAddRoutingRules()
         ],
         "outboundTag": $outbound_tag
     }')
+
     JQ add "$V2_CONFIG" "[$new_rule]"
     Println "$info 路由设置成功\n"
 }
 
-V2rayAddForward()
+V2raySetRoutingBalancers()
 {
-    Println "选择此服务器在 代理转发链 中的位置
-
-  ${green}1.${normal} $red起始服务器${normal} <=> 中转服务器 <=> 目标服务器
-  ${green}2.${normal} 起始服务器 <=> $red中转服务器${normal} <=> 目标服务器
-  ${green}3.${normal} 起始服务器 <=> 中转服务器 <=> $red目标服务器${normal}
- \n"
-    read -p "请输入数字 [1-3]: " forward_num
-    case $forward_num in
-        1|2) 
-            V2rayAddInbound
-            inbound_tag=$tag
-            Println "$info 设置出站转发组\n"
-            V2rayAddOutbound
-            outbound_tag=$tag
-            V2rayAddRoutingRules
-        ;;
-        3) 
-            V2rayAddInbound
-        ;;
-        *) Println "已取消...\n" && exit 1
-        ;;
-    esac
+    V2rayListRouting
 }
 
-V2rayDeleteForward()
+V2rayGetPolicy()
 {
-    forward_count=$((inbounds_forward_count+outbounds_count))
-    [ "$forward_count" -eq 0 ] && Println "$error 没有转发账号组\n" && exit 1
-    echo -e "输入需要删除的组序号"
-    while read -p "(默认: 取消): " delete_forward_num
-    do
-        case "$delete_forward_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$delete_forward_num" -gt 0 ] && [ "$delete_forward_num" -le $forward_count ]
-                then
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
+    IFS=$'`\t' read -r m_levels_id m_levels_handshake m_levels_conn_idle m_levels_uplink_only \
+    m_levels_downlink_only m_levels_stats_user_uplink m_levels_stats_user_downlink \
+    m_levels_buffer_size policy_system_stats_inbound_uplink policy_system_stats_inbound_downlink \
+    policy_system_stats_outbound_uplink policy_system_stats_outbound_downlink < <($JQ_FILE -r '[
+    ([.policy.levels // {}|to_entries[]|.key|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.handshake // 4|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.connIdle // 300|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.uplinkOnly // 2|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.downlinkOnly // 5|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.statsUserUplink // false|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.statsUserDownlink // false|tostring|. + "^"]|join("") + "`"),
+    ([.policy.levels // {}|to_entries[]|.value.bufferSize // 512|tostring|. + "^"]|join("") + "`"),
+    (.policy.system.statsInboundUplink // false|tostring|. + "`"),
+    (.policy.system.statsInboundDownlink // false|tostring|. + "`"),
+    (.policy.system.statsOutboundUplink // false|tostring|. + "`"),
+    (.policy.system.statsOutboundDownlink // false|tostring|. + "`")]|@tsv' "$V2_CONFIG")
 
-    if [ "$delete_forward_num" -gt "$inbounds_forward_count" ] 
+    if [ -n "$m_levels_id" ] 
     then
-        jq_path='["outbounds"]'
-        match_index=$((delete_forward_num-inbounds_forward_count-1))
-        match="${outbounds_tag[match_index]}"
+        IFS="^" read -r -a policy_levels_id <<< "$m_levels_id"
+        policy_levels_count=${#policy_levels_id[@]}
+
+        if_null=""
+
+        for((policy_levels_i=0;policy_levels_i<policy_levels_count;policy_levels_i++));
+        do
+            if_null="$if_null^"
+        done
+
+        IFS="^" read -r -a policy_levels_handshake <<< "${m_levels_handshake:-$if_null}"
+        IFS="^" read -r -a policy_levels_conn_idle <<< "${m_levels_conn_idle:-$if_null}"
+        IFS="^" read -r -a policy_levels_uplink_only <<< "${m_levels_uplink_only:-$if_null}"
+        IFS="^" read -r -a policy_levels_downlink_only <<< "${m_levels_downlink_only:-$if_null}"
+        IFS="^" read -r -a policy_levels_stats_user_uplink <<< "${m_levels_stats_user_uplink:-$if_null}"
+        IFS="^" read -r -a policy_levels_stats_user_downlink <<< "${m_levels_stats_user_downlink:-$if_null}"
+        IFS="^" read -r -a policy_levels_buffer_size <<< "${m_levels_buffer_size:-$if_null}"
     else
-        jq_path='["inbounds"]'
-        match_index=$((delete_forward_num+inbounds_nginx_count-1))
-        match="${inbounds_tag[match_index]}"
-    fi
-
-    JQ delete "$V2_CONFIG" tag "\"$match\""
-    Println "$info 转发账号组删除成功\n"
-}
-
-V2rayAddForwardAccount()
-{
-    forward_count=$((inbounds_forward_count+outbounds_count))
-    [ "$forward_count" -eq 0 ] && Println "$error 没有转发账号组, 请先添加组\n" && exit 1
-    echo -e "输入组序号"
-    while read -p "(默认: 取消): " add_forward_account_num
-    do
-        case "$add_forward_account_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$add_forward_account_num" -gt 0 ] && [ "$add_forward_account_num" -le $forward_count ]
-                then
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
-
-    V2raySetLevel
-
-    if [ "$add_forward_account_num" -gt "$inbounds_forward_count" ] 
-    then
-        match_index=$((add_forward_account_num-inbounds_forward_count-1))
-        outbounds_index=$((match_index+2))
-        V2raySetAddress
-        V2raySetOutboundPort
-        if [ "${outbounds_protocol[match_index]}" == "vmess" ] 
-        then
-            V2raySetId
-            V2raySetAlterId
-            V2raySetSecurity
-
-            found=0
-            vnext_index=0
-
-            while IFS="=" read -r map_address map_port 
-            do
-                vnext_index=$((vnext_index+1))
-                if [ "$map_address" == "$address" ] && [ "$map_port" == "$port" ]
-                then
-                    found=1
-                    break
-                fi
-            done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.vnext[] | [.address,.port] | join("=")' "$V2_CONFIG")
-
-            if [ "$found" -eq 0 ] 
-            then
-                jq_path='["outbounds",'"$outbounds_index"',"settings","vnext"]'
-                new_account=$(
-                $JQ_FILE -n --arg address "$address" --arg port "$port" \
-                    --arg id "$id" --arg alterId "$alter_id" \
-                    --arg security "$security" --arg level "$level" \
-                '{
-                    "address": $address,
-                    "port": $port | tonumber,
-                    "users": [
-                        {
-                            "id": $id,
-                            "alterId": $alterId | tonumber,
-                            "security": $security,
-                            "level": $level | tonumber
-                        }
-                    ]
-                }')
-            else
-                jq_path='["outbounds",'"$outbounds_index"',"settings","vnext",'"$((vnext_index-1))"']'
-                new_account=$(
-                $JQ_FILE -n --arg id "$id" --arg alterId "$alter_id" \
-                    --arg security "$security" --arg level "$level" \
-                '{
-                    "id": $id,
-                    "alterId": $alterId | tonumber,
-                    "security": $security,
-                    "level": $level | tonumber
-                }')
-            fi
-
-        else
-            V2raySetHttpAccount
-
-            found=0
-            servers_index=0
-
-            while IFS="=" read -r map_address map_port 
-            do
-                servers_index=$((servers_index+1))
-                if [ "$map_address" == "$address" ] && [ "$map_port" == "$port" ]
-                then
-                    found=1
-                    break
-                fi
-            done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.servers[] | [.address,.port] | join("=")' "$V2_CONFIG")
-
-            if [ "$found" -eq 0 ] 
-            then
-                jq_path='["outbounds",'"$outbounds_index"',"settings","servers"]'
-                new_account=$(
-                $JQ_FILE -n --arg address "$address" --arg port "$port" \
-                    --arg user "$user" --arg pass "$pass" \
-                '{
-                    "address": $address,
-                    "port": $port | tonumber,
-                    "users": [
-                        {
-                            "user": $user,
-                            "pass": $pass
-                        }
-                    ]
-                }')
-            else
-                jq_path='["outbounds",'"$outbounds_index"',"settings","servers",'"$((servers_index-1))"']'
-                new_account=$(
-                $JQ_FILE -n --arg user "$user" --arg pass "$pass" \
-                '{
-                    "user": $user,
-                    "pass": $pass
-                }')
-            fi
-        fi
-    else
-        match_index=$((add_forward_account_num+inbounds_nginx_count-1))
-        if [ "${inbounds_protocol[match_index]}" == "vmess" ] 
-        then
-            V2raySetId
-            V2raySetAlterId
-            V2raySetEmail
-            jq_path='["inbounds",'"$match_index"',"settings","clients"]'
-            new_account=$(
-            $JQ_FILE -n --arg id "$id" --arg level "$level" \
-                --arg alterId "$alter_id" --arg email "$email" \
-            '{
-                "id": $id,
-                "level": $level | tonumber,
-                "alterId": $alterId | tonumber,
-                "email": $email
-            }')
-        else
-            V2raySetHttpAccount
-            jq_path='["inbounds",'"$match_index"',"settings","accounts"]'
-            new_account=$(
-            $JQ_FILE -n --arg user "$user" --arg pass "$pass" \
-            '{
-                "user": $user,
-                "pass": $pass
-            }')
-        fi
-    fi
-    JQ add "$V2_CONFIG" "[$new_account]"
-    Println "$info 转发账号添加成功\n"
-}
-
-V2rayDeleteForwardAccount()
-{
-    forward_count=$((inbounds_forward_count+outbounds_count))
-    [ "$forward_count" -eq 0 ] && Println "$error 没有转发账号组\n" && exit 1
-    echo -e "输入组序号"
-    while read -p "(默认: 取消): " delete_forward_account_num
-    do
-        case "$delete_forward_account_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$delete_forward_account_num" -gt 0 ] && [ "$delete_forward_account_num" -le $forward_count ]
-                then
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
-
-    if [ "$delete_forward_account_num" -gt "$inbounds_forward_count" ] 
-    then
-        match_index=$((delete_forward_account_num-inbounds_forward_count-1))
-        outbounds_index=$((match_index+2))
-
-        if [ "${outbounds_protocol[match_index]}" == "vmess" ] 
-        then
-            vnext_count=0
-            vnext_list=""
-            while IFS="=" read -r map_address map_port
-            do
-                vnext_count=$((vnext_count+1))
-                vnext_list=$vnext_list"# $green$vnext_count${normal}\r\033[6C服务器: $green$map_address${normal} 端口: $green$map_port${normal}\n\n"
-            done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.vnext[] | [.address,.port] | join("=")' "$V2_CONFIG")
-
-            if [ -z "$vnext_list" ] 
-            then
-                Println "$error 此转发账号组里没有账号\n" && exit 1
-            else
-                echo -e "$vnext_list"
-                echo "输入服务器序号"
-                while read -p "(默认: 取消): " vnext_index
-                do
-                    case "$vnext_index" in
-                        "")
-                            Println "已取消...\n" && exit 1
-                        ;;
-                        *[!0-9]*)
-                            Println "$error 请输入正确的序号\n"
-                        ;;
-                        *)
-                            if [ "$vnext_index" -gt 0 ] && [ "$vnext_index" -le "$vnext_count" ]
-                            then
-                                vnext_index=$((vnext_index-1))
-                                break
-                            else
-                                Println "$error 请输入正确的序号\n"
-                            fi
-                        ;;
-                    esac
-                done
-
-                accounts_list=""
-                accounts_count=0
-                while IFS="=" read -r map_id map_alter_id map_security map_level
-                do
-                    accounts_count=$((accounts_count+1))
-                    accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6CID: $green$map_id${normal} alterId: $green$map_alter_id${normal} 加密方式: $green$map_security${normal} 等级: $green$map_level${normal}\n\n"
-                done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.vnext['"$vnext_index"'].users[] | [.id,.alterId,.security,.level] | join("=")' "$V2_CONFIG")
-
-                if [ -z "$accounts_list" ] 
-                then
-                    echo
-                    yn_options=( '否' '是' )
-                    inquirer list_input "此服务器没有账号, 是否删除此服务器" yn_options delete_server_yn
-
-                    if [[ $delete_server_yn == "是" ]] 
-                    then
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","vnext"]'
-                        JQ delete "$V2_CONFIG" "$vnext_index"
-                        Println "$info 服务器删除成功\n"
-                    else
-                        Println "已取消...\n" && exit 1
-                    fi
-                else
-                    accounts_list=$accounts_list"# $green$((accounts_count+1))${normal}\r\033[6C删除所有账号\n\n"
-                    accounts_list=$accounts_list"# $green$((accounts_count+2))${normal}\r\033[6C删除此服务器"
-                    Println "$accounts_list\n"
-                    echo "输入序号"
-                    while read -p "(默认: 取消): " accounts_index
-                    do
-                        case "$accounts_index" in
-                            "")
-                                Println "已取消...\n" && exit 1
-                            ;;
-                            *[!0-9]*)
-                                Println "$error 请输入正确的序号\n"
-                            ;;
-                            *)
-                                if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+2)) ]
-                                then
-                                    accounts_index=$((accounts_index-1))
-                                    break
-                                else
-                                    Println "$error 请输入正确的序号\n"
-                                fi
-                            ;;
-                        esac
-                    done
-
-                    if [ "$accounts_index" == "$((accounts_count+1))" ] 
-                    then
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","vnext"]'
-                        JQ delete "$V2_CONFIG" "$vnext_index"
-                        Println "$info 服务器删除成功\n"
-                    elif [ "$accounts_index" == "$accounts_count" ] 
-                    then
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","vnext",'"$vnext_index"',"users"]'
-                        JQ replace "$V2_CONFIG" "[]"
-                        Println "$info 账号删除成功\n"
-                    else
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","vnext",'"$vnext_index"',"users"]'
-                        JQ delete "$V2_CONFIG" "$accounts_index"
-                        Println "$info 账号删除成功\n"
-                    fi
-                fi
-            fi
-        else
-            servers_count=0
-            servers_list=""
-            while IFS="=" read -r map_address map_port
-            do
-                servers_count=$((servers_count+1))
-                servers_list=$servers_list"# $green$servers_count${normal}\r\033[6C服务器: $green$map_address${normal} 端口: $green$map_port${normal}\n\n"
-            done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.servers[] | [.address,.port] | join("=")' "$V2_CONFIG")
-
-            if [ -z "$servers_list" ] 
-            then
-                Println "$error 此转发账号组里没有账号\n" && exit 1
-            else
-                Println "$servers_list"
-                echo "输入服务器序号"
-                while read -p "(默认: 取消): " servers_index
-                do
-                    case "$servers_index" in
-                        "")
-                            Println "已取消...\n" && exit 1
-                        ;;
-                        *[!0-9]*)
-                            Println "$error 请输入正确的序号\n"
-                        ;;
-                        *)
-                            if [ "$servers_index" -gt 0 ] && [ "$servers_index" -le "$servers_count" ]
-                            then
-                                servers_index=$((servers_index-1))
-                                break
-                            else
-                                Println "$error 请输入正确的序号\n"
-                            fi
-                        ;;
-                    esac
-                done
-
-                accounts_list=""
-                accounts_count=0
-                while IFS= read -r map_user map_pass
-                do
-                    accounts_count=$((accounts_count+1))
-                    map_user=${map_user#\"}
-                    map_pass=${map_pass%\"}
-                    accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C用户名: $green$map_user${normal} 密码: $green$map_pass${normal}\n\n"
-                done < <($JQ_FILE '.outbounds['"$outbounds_index"'].settings.servers['"$servers_index"'].users[] | [.user,.pass] | join("^")' "$V2_CONFIG")
-
-                if [ -z "$accounts_list" ] 
-                then
-                    echo
-                    yn_options=( '否' '是' )
-                    inquirer list_input "此服务器没有账号, 是否删除此服务器" yn_options delete_server_yn
-
-                    if [[ $delete_server_yn == "是" ]] 
-                    then
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","servers"]'
-                        JQ delete "$V2_CONFIG" "$servers_index"
-                        Println "$info 服务器删除成功\n"
-                    else
-                        Println "已取消...\n" && exit 1
-                    fi
-                else
-                    accounts_list=$accounts_list"# $green$((accounts_count+1))${normal}\r\033[6C删除所有账号\n\n"
-                    accounts_list=$accounts_list"# $green$((accounts_count+2))${normal}\r\033[6C删除此服务器"
-                    Println "$accounts_list\n"
-                    echo "输入序号"
-                    while read -p "(默认: 取消): " accounts_index
-                    do
-                        case "$accounts_index" in
-                            "")
-                                Println "已取消...\n" && exit 1
-                            ;;
-                            *[!0-9]*)
-                                Println "$error 请输入正确的序号\n"
-                            ;;
-                            *)
-                                if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+2)) ]
-                                then
-                                    accounts_index=$((accounts_index-1))
-                                    break
-                                else
-                                    Println "$error 请输入正确的序号\n"
-                                fi
-                            ;;
-                        esac
-                    done
-
-                    if [ "$accounts_index" == "$((accounts_count+1))" ] 
-                    then
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","servers"]'
-                        JQ delete "$V2_CONFIG" "$servers_index"
-                        Println "$info 服务器删除成功\n"
-                    elif [ "$accounts_index" == "$accounts_count" ] 
-                    then
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","servers",'"$servers_index"',"users"]'
-                        JQ replace "$V2_CONFIG" "[]"
-                        Println "$info 账号删除成功\n"
-                    else
-                        jq_path='["outbounds",'"$outbounds_index"',"settings","servers",'"$servers_index"',"users"]'
-                        JQ delete "$V2_CONFIG" "$accounts_index"
-                        Println "$info 账号删除成功\n"
-                    fi
-                fi
-            fi
-        fi
-    else
-        match_index=$((delete_forward_account_num+inbounds_nginx_count-1))
-        if [ "${inbounds_protocol[match_index]}" == "vmess" ] 
-        then
-            accounts_count=0
-            accounts_list=""
-            while IFS="=" read -r map_id map_alter_id map_security map_level
-            do
-                accounts_count=$((accounts_count+1))
-                accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6CID: $green$map_id${normal} alterId: $green$map_alter_id${normal} 加密方式: $green$map_security${normal} 等级: $green$map_level${normal}\n\n"
-            done < <($JQ_FILE -r '.inbounds['"$match_index"'].settings.clients[] | [.id,.alterId,.security,.level] | join("=")' "$V2_CONFIG")
-
-            if [ -z "$accounts_list" ] 
-            then
-                Println "$error 此账户组没有账号\n" && exit 1
-            else
-                accounts_list=$accounts_list"# $green$((accounts_count+1))${normal}\r\033[6C删除所有账号"
-                Println "$accounts_list\n"
-                echo "输入序号"
-                while read -p "(默认: 取消): " accounts_index
-                do
-                    case "$accounts_index" in
-                        "")
-                            Println "已取消...\n" && exit 1
-                        ;;
-                        *[!0-9]*)
-                            Println "$error 请输入正确的序号\n"
-                        ;;
-                        *)
-                            if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+1)) ]
-                            then
-                                accounts_index=$((accounts_index-1))
-                                break
-                            else
-                                Println "$error 请输入正确的序号\n"
-                            fi
-                        ;;
-                    esac
-                done
-
-                if [ "$accounts_index" == "$accounts_count" ] 
-                then
-                    jq_path='["inbounds",'"$match_index"',"settings","clients"]'
-                    JQ replace "$V2_CONFIG" "[]"
-                else
-                    jq_path='["inbounds",'"$match_index"',"settings","clients"]'
-                    JQ delete "$V2_CONFIG" "$accounts_index"
-                fi
-                Println "$info 账号删除成功\n"
-            fi
-        else
-            accounts_list=""
-            accounts_count=0
-            while IFS="^" read -r map_user map_pass
-            do
-                accounts_count=$((accounts_count+1))
-                map_user=${map_user#\"}
-                map_pass=${map_pass%\"}
-                accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C用户名: $green$map_user${normal} 密码: $green$map_pass${normal}\n\n"
-            done < <($JQ_FILE '.inbounds['"$match_index"'].settings.accounts[] | [.user,.pass] | join("^")' "$V2_CONFIG")
-
-            if [ -z "$accounts_list" ] 
-            then
-                 Println "$error 此账户组没有账号\n" && exit 1
-            else
-                accounts_list=$accounts_list"# $green$((accounts_count+1))${normal}\r\033[6C删除所有账号"
-                Println "$accounts_list\n"
-                echo "输入序号"
-                while read -p "(默认: 取消): " accounts_index
-                do
-                    case "$accounts_index" in
-                        "")
-                            Println "已取消...\n" && exit 1
-                        ;;
-                        *[!0-9]*)
-                            Println "$error 请输入正确的序号\n"
-                        ;;
-                        *)
-                            if [ "$accounts_index" -gt 0 ] && [ "$accounts_index" -le $((accounts_count+1)) ]
-                            then
-                                accounts_index=$((accounts_index-1))
-                                break
-                            else
-                                Println "$error 请输入正确的序号\n"
-                            fi
-                        ;;
-                    esac
-                done
-
-                if [ "$accounts_index" == "$accounts_count" ] 
-                then
-                    jq_path='["inbounds",'"$match_index"',"settings","accounts"]'
-                    JQ replace "$V2_CONFIG" "[]"
-                else
-                    jq_path='["inbounds",'"$match_index"',"settings","accounts"]'
-                    JQ delete "$V2_CONFIG" "$accounts_index"
-                fi
-                Println "$info 账号删除成功\n"
-            fi
-        fi
+        policy_levels_count=0
     fi
 }
 
-V2rayListForwardAccount()
+V2raySetPolicyLevels()
 {
-    forward_count=$((inbounds_forward_count+outbounds_count))
-    [ "$forward_count" -eq 0 ] && Println "$error 没有转发账号组\n" && exit 1
-    echo -e "输入组序号"
-    while read -p "(默认: 取消): " list_forward_account_num
-    do
-        case "$list_forward_account_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$list_forward_account_num" -gt 0 ] && [ "$list_forward_account_num" -le $forward_count ]
-                then
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
+    V2rayGetPolicy
+}
 
-    if [ "$list_forward_account_num" -gt "$inbounds_forward_count" ] 
-    then
-        match_index=$((list_forward_account_num-inbounds_forward_count-1))
-        outbounds_index=$((match_index+2))
-
-        if [ "${outbounds_protocol[match_index]}" == "vmess" ] 
-        then
-            vnext_count=0
-            vnext_list=""
-            while IFS="=" read -r map_address map_port
-            do
-                vnext_count=$((vnext_count+1))
-                vnext_list=$vnext_list"# $green$vnext_count${normal}\r\033[6C服务器: $green$map_address${normal} 端口: $green$map_port${normal}\n\n"
-            done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.vnext[] | [.address,.port] | join("=")' "$V2_CONFIG")
-
-            if [ -z "$vnext_list" ] 
-            then
-                Println "$error 此转发账号组里没有账号\n" && exit 1
-            else
-                Println "$vnext_list"
-                echo "输入服务器序号"
-                while read -p "(默认: 取消): " vnext_index
-                do
-                    case "$vnext_index" in
-                        "")
-                            Println "已取消...\n" && exit 1
-                        ;;
-                        *[!0-9]*)
-                            Println "$error 请输入正确的序号\n"
-                        ;;
-                        *)
-                            if [ "$vnext_index" -gt 0 ] && [ "$vnext_index" -le "$vnext_count" ]
-                            then
-                                vnext_index=$((vnext_index-1))
-                                break
-                            else
-                                Println "$error 请输入正确的序号\n"
-                            fi
-                        ;;
-                    esac
-                done
-
-                accounts_list=""
-                accounts_count=0
-                while IFS="=" read -r map_id map_alter_id map_security map_level
-                do
-                    accounts_count=$((accounts_count+1))
-                    accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6CID: $green$map_id${normal} alterId: $green$map_alter_id${normal} 加密方式: $green$map_security${normal} 等级: $green$map_level${normal}\n\n"
-                done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.vnext['"$vnext_index"'].users[] | [.id,.alterId,.security,.level] | join("=")' "$V2_CONFIG")
-
-                if [ -z "$accounts_list" ] 
-                then
-                    Println "$error 此服务器里没有账号\n" && exit 1
-                else
-                    Println "$accounts_list\n"
-                fi
-            fi
-        else
-            servers_count=0
-            servers_address=()
-            servers_port=()
-            servers_list=""
-            while IFS="=" read -r map_address map_port
-            do
-                servers_count=$((servers_count+1))
-                servers_address+=("$map_address")
-                servers_port+=("$map_port")
-                servers_list=$servers_list"# $green$servers_count${normal}\r\033[6C服务器: $green$map_address${normal} 端口: $green$map_port${normal}\n\n"
-            done < <($JQ_FILE -r '.outbounds['"$outbounds_index"'].settings.servers[] | [.address,.port] | join("=")' "$V2_CONFIG")
-
-            if [ -z "$servers_list" ] 
-            then
-                Println "$error 此转发账号组里没有账号\n" && exit 1
-            else
-                Println "$servers_list"
-                echo "输入服务器序号"
-                while read -p "(默认: 取消): " servers_index
-                do
-                    case "$servers_index" in
-                        "")
-                            Println "已取消...\n" && exit 1
-                        ;;
-                        *[!0-9]*)
-                            Println "$error 请输入正确的序号\n"
-                        ;;
-                        *)
-                            if [ "$servers_index" -gt 0 ] && [ "$servers_index" -le "$servers_count" ]
-                            then
-                                servers_index=$((servers_index-1))
-                                break
-                            else
-                                Println "$error 请输入正确的序号\n"
-                            fi
-                        ;;
-                    esac
-                done
-
-                accounts_list=""
-                accounts_count=0
-                while IFS="^" read -r map_user map_pass
-                do
-                    accounts_count=$((accounts_count+1))
-                    map_user=${map_user#\"}
-                    map_pass=${map_pass%\"}
-                    accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C用户名: $green$map_user${normal} 密码: $green$map_pass${normal} 链接: $green${outbounds_protocol[match_index]}://$map_user:$map_pass@${servers_address[servers_index]}:${servers_port[servers_index]}${normal}\n\n"
-                done < <($JQ_FILE '.outbounds['"$outbounds_index"'].settings.servers['"$servers_index"'].users[] | [.user,.pass] | join("^")' "$V2_CONFIG")
-
-                if [ -z "$accounts_list" ] 
-                then
-                    Println "$error 此服务器里没有账号\n" && exit 1
-                else
-                    Println "$accounts_list\n"
-                fi
-            fi
-        fi
-    else
-        match_index=$((list_forward_account_num+inbounds_nginx_count-1))
-        if [ "${inbounds_listen[match_index]}" == "0.0.0.0" ] 
-        then
-            server_ip=$(GetServerIp)
-        else
-            server_ip=${inbounds_listen[match_index]}
-        fi
-        if [ "${inbounds_protocol[match_index]}" == "vmess" ] 
-        then
-            accounts_count=0
-            accounts_list=""
-            while IFS="=" read -r map_id map_alter_id map_security map_level
-            do
-                accounts_count=$((accounts_count+1))
-                accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6CID: $green$map_id${normal} alterId: $green$map_alter_id${normal} 加密方式: $green$map_security${normal} 等级: $green$map_level${normal}\n\n"
-            done < <($JQ_FILE -r '.inbounds['"$match_index"'].settings.clients[] | [.id,.alterId,.security,.level] | join("=")' "$V2_CONFIG")
-
-            if [ -z "$accounts_list" ] 
-            then
-                Println "$error 此账户组没有账号\n" && exit 1
-            else
-                Println "服务器 IP: $green$server_ip${normal}\n\n$accounts_list\n"
-            fi
-        else
-            accounts_list=""
-            accounts_count=0
-            while IFS="^" read -r map_user map_pass
-            do
-                accounts_count=$((accounts_count+1))
-                map_user=${map_user#\"}
-                map_pass=${map_pass%\"}
-                accounts_list=$accounts_list"# $green$accounts_count${normal}\r\033[6C用户名: $green$map_user${normal} 密码: $green$map_pass${normal} 链接: $green${inbounds_protocol[match_index]}://$map_user:$map_pass@$server_ip:${inbounds_port[match_index]}${normal}\n\n"
-            done < <($JQ_FILE '.inbounds['"$match_index"'].settings.accounts[] | [.user,.pass] | join("^")' "$V2_CONFIG")
-
-            if [ -z "$accounts_list" ] 
-            then
-                 Println "$error 此账户组没有账号\n" && exit 1
-            else
-                Println "$accounts_list\n"
-            fi
-        fi
-    fi
+V2raySetPolicySystem()
+{
+    V2rayGetPolicy
 }
 
 V2rayListDomains()
@@ -23935,7 +25037,7 @@ V2rayListDomainsInbound()
             else
                 v2ray_status_text="$red关闭${normal}"
             fi
-            if [[ $domain =~ ^([a-zA-Z0-9](([a-zA-Z0-9-]){0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] || grep -q "proxy_pass http://127.0.0.1:${inbounds_port[nginx_index]}" < "$nginx_prefix/conf/sites_available/$domain.conf" 
+            if [[ $domain =~ ^([a-zA-Z0-9](([a-zA-Z0-9-]){0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$ ]] || grep -q "proxy_pass http://127.0.0.1:${inbounds_port[inbounds_index]}" < "$nginx_prefix/conf/sites_available/$domain.conf" 
             then
                 server_found=0
                 server_flag=0
@@ -23964,7 +25066,7 @@ V2rayListDomainsInbound()
                                 v2ray_domains_inbound_count=$((v2ray_domains_inbound_count+1))
                                 v2ray_domains_inbound+=("$domain")
                                 v2ray_domains_inbound_https_port+=("$server_ports")
-                                v2ray_domains_inbound_list=$v2ray_domains_inbound_list"$green$v2ray_domains_inbound_count.${normal}\r\033[6C域名: $green$domain${normal}, 端口: $green$server_ports${normal}, 协议: ${green}vmess${normal}, 网络: ${green}ws${normal}\n\r\033[6Cpath: $green${inbounds_path[nginx_index]}${normal}, security: ${green}tls${normal}, 状态: $v2ray_status_text\n\n"
+                                v2ray_domains_inbound_list=$v2ray_domains_inbound_list"$green$v2ray_domains_inbound_count.${normal}\r\033[6C域名: $green$domain${normal}, nginx 端口: $green$server_ports${normal} nginx 路径: $green${inbounds_stream_path[inbounds_index]}${normal} 状态: $v2ray_status_text\n\n"
                             fi
                         fi
                     fi
@@ -23979,7 +25081,7 @@ V2rayListDomainsInbound()
                         server_ports="$server_ports$line"
                     fi
 
-                    if [[ $server_found -eq 1 ]] && [[ $line == *"proxy_pass http://127.0.0.1:${inbounds_port[nginx_index]}"* ]]
+                    if [[ $server_found -eq 1 ]] && [[ $line == *"proxy_pass http://127.0.0.1:${inbounds_port[inbounds_index]}"* ]]
                     then
                         is_inbound=1
                     fi
@@ -24115,9 +25217,9 @@ V2rayAppendDomainConf()
         ssl_certificate      $nginx_prefix/conf/sites_crt/$server_domain.crt;
         ssl_certificate_key  $nginx_prefix/conf/sites_crt/$server_domain.key;
 
-        location ${inbounds_path[nginx_index]} {
+        location $nginx_stream_path {
             proxy_redirect off;
-            proxy_pass http://127.0.0.1:${inbounds_port[nginx_index]};
+            proxy_pass $nginx_proxy_pass;
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection upgrade;
@@ -24155,30 +25257,28 @@ V2rayAddDomain()
         fi
 
         NginxConfigServerHttpsPort
-        V2rayListNginx
+        V2rayListInbounds nginx
+        V2raySelectInbound
 
-        Println "绑定账号组,输入序号"
-        while read -p "(默认: 取消): " nginx_num
-        do
-            case "$nginx_num" in
-                "")
-                    Println "已取消...\n" && exit 1
-                ;;
-                *[!0-9]*)
-                    Println "$error 请输入正确的序号\n"
-                ;;
-                *)
-                    if [ "$nginx_num" -gt 0 ] && [ "$nginx_num" -le $inbounds_nginx_count ]
-                    then
-                        nginx_num=$((nginx_num-1))
-                        nginx_index=${inbounds_nginx_index[nginx_num]}
-                        break
-                    else
-                        Println "$error 请输入正确的序号\n"
-                    fi
-                ;;
-            esac
-        done
+        if [ "${inbounds_stream_network[inbounds_index]}" == "domainsocket" ] 
+        then
+            Println "$error 不能使用此入站\n"
+            exit 1
+        fi
+
+        if [ -z "${inbounds_stream_path[inbounds_index]}" ] 
+        then
+            echo
+            inquirer text_input "输入客户端连接 nginx 的路径(比如 /xxx ): " nginx_stream_path "随机"
+            if [ "$nginx_stream_path" == "随机" ] 
+            then
+                nginx_stream_path="/$(RandStr)"
+            fi
+            nginx_proxy_pass="http://127.0.0.1:${inbounds_port[inbounds_index]}/"
+        else
+            nginx_stream_path=${inbounds_stream_path[inbounds_index]}
+            nginx_proxy_pass="http://127.0.0.1:${inbounds_port[inbounds_index]}"
+        fi
 
         DomainInstallCert
         V2rayAppendDomainConf
@@ -24192,29 +25292,28 @@ V2rayAddDomain()
 
 V2rayDomainServerAddV2rayPort()
 {
-    V2rayListNginx
-    Println "绑定账号组,输入序号"
-    while read -p "(默认: 取消): " nginx_num
-    do
-        case "$nginx_num" in
-            "")
-                Println "已取消...\n" && exit 1
-            ;;
-            *[!0-9]*)
-                Println "$error 请输入正确的序号\n"
-            ;;
-            *)
-                if [ "$nginx_num" -gt 0 ] && [ "$nginx_num" -le $inbounds_nginx_count ]
-                then
-                    nginx_num=$((nginx_num-1))
-                    nginx_index=${inbounds_nginx_index[nginx_num]}
-                    break
-                else
-                    Println "$error 请输入正确的序号\n"
-                fi
-            ;;
-        esac
-    done
+    V2rayListInbounds nginx
+    V2raySelectInbound
+
+    if [ "${inbounds_stream_network[inbounds_index]}" == "domainsocket" ] 
+    then
+        Println "$error 不能使用此入站\n"
+        exit 1
+    fi
+
+    if [ -z "${inbounds_stream_path[inbounds_index]}" ] 
+    then
+        echo
+        inquirer text_input "输入客户端连接 nginx 的路径(比如 /xxx ): " nginx_stream_path "随机"
+        if [ "$nginx_stream_path" == "随机" ] 
+        then
+            nginx_stream_path="/$(RandStr)"
+        fi
+        nginx_proxy_pass="http://127.0.0.1:${inbounds_port[inbounds_index]}/"
+    else
+        nginx_stream_path=${inbounds_stream_path[inbounds_index]}
+        nginx_proxy_pass="http://127.0.0.1:${inbounds_port[inbounds_index]}"
+    fi
 
     v2ray_domain_server_found=0
     v2ray_domain_server_flag=0
@@ -24278,9 +25377,9 @@ V2rayDomainServerAddV2rayPort()
         if [[ $v2ray_domain_server_found -eq 1 ]] && [[ $line == *"ssl_certificate_key "* ]]
         then
             line_add="$line\n
-        location ${inbounds_path[nginx_index]} {
+        location $nginx_stream_path {
             proxy_redirect off;
-            proxy_pass http://127.0.0.1:${inbounds_port[nginx_index]};
+            proxy_pass $nginx_proxy_pass;
             proxy_http_version 1.1;
             proxy_set_header Upgrade \$http_upgrade;
             proxy_set_header Connection upgrade;
@@ -24296,7 +25395,7 @@ V2rayDomainServerAddV2rayPort()
             v2ray_port_found=1
             v2ray_port=${line##*:}
             v2ray_port=${v2ray_port%;*}
-            line_edit="${line%%proxy_pass*}proxy_pass http://127.0.0.1:${inbounds_port[nginx_index]};"
+            line_edit="${line%%proxy_pass*}proxy_pass http://127.0.0.1:${inbounds_port[inbounds_index]};"
         fi
 
         if [[ $v2ray_domain_server_found -eq 1 ]] 
@@ -25635,7 +26734,7 @@ ViewCloudflareSubdomain()
     cf_subdomains_list=""
     for((i=0;i<${#cf_hosted_cnames[@]};i++));
     do
-        cf_subdomains_list="$cf_subdomains_list $green$((i+1)).${normal}\r\033[6CCNAME: $green${cf_hosted_cnames[i]}${normal} => $green${cf_resolve_tos[i]}${normal}\n\r\033[6C解析地址: $green${cf_forward_tos[i]}${normal}\n\n"
+        cf_subdomains_list="$cf_subdomains_list $green$((i+1)).${normal}\r\033[6CCNAME: $green${cf_hosted_cnames[i]}${normal} => $green${cf_resolve_tos[i]}${normal}\n\033[6C解析地址: $green${cf_forward_tos[i]}${normal}\n\n"
     done
 
     if [ -z "$cf_subdomains_list" ] 
@@ -25672,7 +26771,7 @@ ViewCloudflareSubdomain()
             cf_subdomains_list=""
             for((i=0;i<${#cf_hosted_cnames[@]};i++));
             do
-                cf_subdomains_list="$cf_subdomains_list $green$((i+1)).${normal}\r\033[6CCNAME: $green${cf_hosted_cnames[i]}${normal} => $green${cf_resolve_tos[i]}${normal}\n\r\033[6C解析地址: $green${cf_forward_tos[i]}${normal}\n\n"
+                cf_subdomains_list="$cf_subdomains_list $green$((i+1)).${normal}\r\033[6CCNAME: $green${cf_hosted_cnames[i]}${normal} => $green${cf_resolve_tos[i]}${normal}\n\033[6C解析地址: $green${cf_forward_tos[i]}${normal}\n\n"
             done
 
             if [ "$cf_zone_ssl_status" == "ready" ] 
@@ -26275,7 +27374,6 @@ CloudflarePartnerMenu()
         *) Println "$error 请输入正确的数字 [1-18]\n"
         ;;
     esac
-    exit 0
 }
 
 InstallWrangler()
@@ -28493,7 +29591,6 @@ CloudflareWorkersMenu()
         *) Println "$error 请输入正确的数字 [1-10]\n"
         ;;
     esac
-    exit 0
 }
 
 InstallIbmcfCli()
@@ -30341,7 +31438,6 @@ IbmV2rayMenu()
         *) Println "$error 请输入正确的数字 [1-15]\n"
         ;;
     esac
-    exit 0
 }
 
 SetIbmcfAppCron()
@@ -30699,7 +31795,6 @@ func main() {
             ibmcloud cf push -f "${apps_name[i]}_manifest.yml"
         fi
     done
-    exit 0
 }
 
 IbmcfMenu()
@@ -30761,7 +31856,6 @@ IbmcfMenu()
         *) Println "$error 请输入正确的数字 [1-16]\n"
         ;;
     esac
-    exit 0
 }
 
 SetVipHostIp()
@@ -30966,7 +32060,7 @@ GetVipHosts()
         vip_hosts_channel_name+=("$channels_name")
         channels_epg_id=${channels_epg_id%\"}
         vip_hosts_channel_epg_id+=("$channels_epg_id")
-        vip_hosts_list="$vip_hosts_list $green$vip_hosts_count.${normal}\r\033[6C服务器: $green$ip${normal}  端口: $green$port${normal}  频道数: $green$channels_count${normal}$status_text\n\r\033[6Cseed: $green$seed${normal}  token: $green${token:-无}${normal}\n\n"
+        vip_hosts_list="$vip_hosts_list $green$vip_hosts_count.${normal}\r\033[6C服务器: $green$ip${normal}  端口: $green$port${normal}  频道数: $green$channels_count${normal}$status_text\n\033[6Cseed: $green$seed${normal}  token: $green${token:-无}${normal}\n\n"
     done < <($JQ_FILE '.hosts[]|[.ip,.port,.seed,.token,.status,(.channels|length),([.channels[].id]|join("|")),([.channels[].name]|join("|")),([.channels[].epg_id]|join("|"))]|join("^")' "$VIP_FILE")
     return 0
 }
@@ -31283,7 +32377,7 @@ GetVipUsers()
         else
             m3u_link="${FFMPEG_MIRROR_LINK%/*}/vip/$license/playlist.m3u"
         fi
-        vip_users_list="$vip_users_list $green$vip_users_count.${normal}\r\033[6C用户名: $green$name${normal}  ip: $green$ip${normal}  到期日: $green$expire_text${normal}\n\r\033[6C授权码: $green$license${normal}  认证方式: $green$sum${normal}\n\r\033[6Cm3u 播放链接: $green$m3u_link${normal}\n\n"
+        vip_users_list="$vip_users_list $green$vip_users_count.${normal}\r\033[6C用户名: $green$name${normal}  ip: $green$ip${normal}  到期日: $green$expire_text${normal}\n\033[6C授权码: $green$license${normal}  认证方式: $green$sum${normal}\n\033[6Cm3u 播放链接: $green$m3u_link${normal}\n\n"
     done < <($JQ_FILE '.users[]|[.ip,.license,.sum,.expire,.name]|join(":")' "$VIP_FILE")
     return 0
 }
@@ -32497,7 +33591,7 @@ ViewVipUserChannel()
             fi
             if [ "$now" -lt "$vip_user_expire" ] || [ "$vip_user_expire" -eq 0 ]
             then
-                vip_users_list="$vip_users_list $green$((i+1)).${normal}\r\033[6C用户名: $green$vip_user_name${normal}  ip: $green$vip_user_ip${normal}  到期日: $green$expire_text${normal}\n\r\033[6C授权码: $green$vip_user_license${normal}\n\r\033[6Cm3u 播放链接: $green${FFMPEG_MIRROR_LINK%/*}/vip/$vip_user_license/playlist.m3u${normal}\n\n"
+                vip_users_list="$vip_users_list $green$((i+1)).${normal}\r\033[6C用户名: $green$vip_user_name${normal}  ip: $green$vip_user_ip${normal}  到期日: $green$expire_text${normal}\n\033[6C授权码: $green$vip_user_license${normal}\n\033[6Cm3u 播放链接: $green${FFMPEG_MIRROR_LINK%/*}/vip/$vip_user_license/playlist.m3u${normal}\n\n"
             fi
         done
 
@@ -33001,6 +34095,7 @@ then
     else
         IbmcfMenu
     fi
+    exit 0
 elif [ "${0##*/}" == "cf" ] || [ "${0##*/}" == "cf.sh" ]
 then
     CheckShFile
@@ -33050,6 +34145,7 @@ then
     else
         CloudflarePartnerMenu
     fi
+    exit 0
 elif [ "${0##*/}" == "or" ] || [ "${0##*/}" == "or.sh" ]
 then
     CheckShFile
@@ -33474,32 +34570,42 @@ then
   ${green}1.${normal} 安装
   ${green}2.${normal} 升级
   ${green}3.${normal} 配置域名
+  ${green}4.${normal} 查看状态
 ————————————
-  ${green}4.${normal} 查看账号
-  ${green}5.${normal} 添加账号组
-  ${green}6.${normal} 添加账号
+  ${green}5.${normal} 查看入站
+  ${green}6.${normal} 添加入站
+  ${green}7.${normal} 添加入站账号
 ————————————
-  ${green}7.${normal} 查看转发账号
-  ${green}8.${normal} 添加转发账号组
-  ${green}9.${normal} 添加转发账号
+  ${green}8.${normal} 查看出站
+  ${green}9.${normal} 添加出站
+ ${green}10.${normal} 添加出站账号
 ————————————
- ${green}10.${normal} 删除账号组
- ${green}11.${normal} 删除账号
- ${green}12.${normal} 删除转发账号组
- ${green}13.${normal} 删除转发账号
+ ${green}11.${normal} 查看DNS
+ ${green}12.${normal} 添加DNS
 ————————————
- ${green}14.${normal} 设置路由
- ${green}15.${normal} 设置等级
+ ${green}13.${normal} 删除入站
+ ${green}14.${normal} 删除入站账号
+ ${green}15.${normal} 删除出站
+ ${green}16.${normal} 删除出站账号
+ ${green}17.${normal} 删除DNS
 ————————————
- ${green}16.${normal} 查看流量
- ${green}17.${normal} 开关
- ${green}18.${normal} 重启
+ ${green}18.${normal} 查看路由
+ ${green}19.${normal} 设置域名解析策略
+ ${green}20.${normal} 设置路由规则
+ ${green}21.${normal} 设置负载均衡器
+————————————
+ ${green}22.${normal} 查看本地策略
+ ${green}23.${normal} 设置用户等级
+ ${green}24.${normal} 设置系统策略
+————————————
+ ${green}25.${normal} 查看流量
+ ${green}26.${normal} 开关
+ ${green}27.${normal} 重启
 
- $tip 使用: ${green}$nginx_name${normal}
  $tip 输入: v2 打开面板
 
 "
-    read -p "请输入数字 [1-18]: " v2ray_num
+    read -p "请输入数字 [1-27]: " v2ray_num
     case $v2ray_num in
         1) 
             if [ -e "$V2_CONFIG" ] 
@@ -33574,110 +34680,92 @@ then
         ;;
         4) 
             V2rayStatus
-            V2rayConfigUpdate
-            if [ ! -d "$nginx_prefix" ] 
-            then
-                Println "$error $nginx_name 未安装 ! 如需通过 $nginx_name 连接 v2ray 需输入 $nginx_ctl 安装\n"
-                yn_options=( '否' '是' )
-                inquirer list_input "是否继续" yn_options continue_yn
-                if [[ $continue_yn == "否" ]]
-                then
-                    Println "已取消...\n"
-                    exit 1
-                fi
-            else
-                NginxCheckDomains
-            fi
-            V2rayListNginx
-            V2rayListNginxAccounts
         ;;
-        5)
+        5) 
             V2rayConfigUpdate
-            if [ ! -d "$nginx_prefix" ] 
-            then
-                Println "$error $nginx_name 未安装 ! 如需通过 $nginx_name 连接 v2ray 需输入 $nginx_ctl 安装\n"
-                yn_options=( '否' '是' )
-                inquirer list_input "是否继续" yn_options continue_yn
-                if [[ $continue_yn == "否" ]]
-                then
-                    Println "已取消...\n"
-                    exit 1
-                fi
-            else
-                NginxCheckDomains
-            fi
-            V2rayAddNginx
+            V2rayListInboundAccounts
         ;;
         6)
             V2rayConfigUpdate
-            if [ ! -d "$nginx_prefix" ] 
-            then
-                Println "$error $nginx_name 未安装 ! 如需通过 $nginx_name 连接 v2ray 需输入 $nginx_ctl 安装\n"
-                yn_options=( '否' '是' )
-                inquirer list_input "是否继续" yn_options continue_yn
-                if [[ $continue_yn == "否" ]]
-                then
-                    Println "已取消...\n"
-                    exit 1
-                fi
-            else
-                NginxCheckDomains
-            fi
-            V2rayListNginx
-            V2rayAddNginxAccount
+            V2rayAddInbound
         ;;
         7)
-            V2rayStatus
             V2rayConfigUpdate
-            V2rayListForward
-            V2rayListForwardAccount
+            V2rayAddInboundAccount
         ;;
         8)
             V2rayConfigUpdate
-            V2rayListForward
-            V2rayAddForward
+            V2rayListOutboundAccounts
         ;;
         9)
             V2rayConfigUpdate
-            V2rayListForward
-            V2rayAddForwardAccount
+            V2rayAddOutbound
         ;;
         10)
             V2rayConfigUpdate
-            V2rayListNginx
-            V2rayDeleteNginx
+            V2rayAddOutboundAccount
         ;;
         11)
             V2rayConfigUpdate
-            V2rayListNginx
-            V2rayDeleteNginxAccount
+            V2rayListDns
         ;;
         12)
             V2rayConfigUpdate
-            V2rayListForward
-            V2rayDeleteForward
+            V2rayAddDns
         ;;
         13)
             V2rayConfigUpdate
-            V2rayListForward
-            V2rayDeleteForwardAccount
+            V2rayDeleteInbound
         ;;
         14)
-            Println "$error not ready~\n" && exit 1
             V2rayConfigUpdate
-            V2rayConfigRouting
+            V2rayDeleteInboundAccount
         ;;
         15)
-            Println "$error not ready~\n" && exit 1
             V2rayConfigUpdate
-            V2rayConfigLevels
+            V2rayDeleteOutbound
         ;;
         16)
-            Println "$error not ready~\n" && exit 1
+            V2rayConfigUpdate
+            V2rayDeleteOutboundAccount
+        ;;
+        17)
+            V2rayConfigUpdate
+            V2rayDeleteDns
+        ;;
+        18)
+            V2rayConfigUpdate
+            V2rayListRouting
+        ;;
+        19)
+            V2rayConfigUpdate
+            V2raySetRoutingDomainStrategy
+        ;;
+        20)
+            V2rayConfigUpdate
+            V2raySetRoutingRules
+        ;;
+        21)
+            V2rayConfigUpdate
+            V2raySetRoutingBalancers
+        ;;
+        22)
+            V2rayConfigUpdate
+            V2rayListPolicy
+        ;;
+        23)
+            V2rayConfigUpdate
+            V2raySetPolicyLevels
+        ;;
+        24)
+            V2rayConfigUpdate
+            V2raySetPolicySystem
+        ;;
+        25)
             V2rayConfigUpdate
             V2rayListTraffic
         ;;
-        17) 
+        26) 
             if [ ! -e "$V2_CONFIG" ] 
             then
                 Println "$error v2ray 未安装...\n" && exit 1
@@ -33707,7 +34795,7 @@ then
                 fi
             fi
         ;;
-        18) 
+        27) 
             if [ ! -e "$V2_CONFIG" ] 
             then
                 Println "$error v2ray 未安装...\n" && exit 1
@@ -33715,7 +34803,7 @@ then
             systemctl restart v2ray > /dev/null 2>&1
             Println "$info v2ray 已重启\n"
         ;;
-        *) Println "$error 请输入正确的数字 [1-18]\n"
+        *) Println "$error 请输入正确的数字 [1-27]\n"
         ;;
     esac
     exit 0
@@ -34836,12 +35924,32 @@ then
                     fi
                 fi
             done
-
             exit 0
         ;;
         "s") 
             [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请先安装 !" && exit 1
             Schedule "$@"
+            exit 0
+        ;;
+        "singtel") 
+            Println "$info 检测 singteltv ..."
+            while IFS= read -r line 
+            do
+                if [[ $line =~ epgEndPoint ]] 
+                then
+                    line=${line#*epgEndPoint&#34;:&#34;}
+                    epg_end_point=${line%%&#34*}
+                    line=${line#*tvChannelLists&#34;:}
+                    tv_channel_lists=${line%%,&#34;errorMessage*}
+                    tv_channel_lists=${tv_channel_lists//&#34;/\"}
+                    $JQ_FILE -r '.[]|[
+                        (.title // "空"),
+                        (.channelId // "空"),
+                        (.language // []|join(","))
+                    ]|@tsv' <<< "$tv_channel_lists"
+                    break
+                fi
+            done < <(curl -s -L "https://www.singtel.com/personal/products-services/tv/tv-programme-guide" 2> /dev/null)
             exit 0
         ;;
         "m") 
@@ -34969,539 +36077,500 @@ then
             esac
             exit 0
         ;;
+        "e") 
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+            vim "$CHANNELS_FILE" && exit 0
+        ;;
+        "ee") 
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+            GetDefault
+            [ -z "$d_sync_file" ] && Println "$error sync_file 未设置, 请检查 !\n" && exit 1
+            vim "${d_sync_file%% *}" && exit 0
+        ;;
+        "d")
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+            channels=""
+            while IFS= read -r line 
+            do
+                if [[ $line == *\"pid\":* ]] 
+                then
+                    pid=${line#*:}
+                    pid=${pid%,*}
+                    rand_pid=$pid
+                    while [[ -n $($JQ_FILE '.channels[]|select(.pid=='"$rand_pid"')' "$CHANNELS_FILE") ]] 
+                    do
+                        true &
+                        rand_pid=$!
+                    done
+                    line=${line//$pid/$rand_pid}
+                fi
+                channels="$channels$line"
+            done < <(curl -s -Lm 10 "$DEFAULT_DEMOS")
+            [ -z "$channels" ] && Println "$error 暂时无法连接服务器, 请稍后再试...\n" && exit 1
+            JQ add "$CHANNELS_FILE" channels "$channels"
+            Println "$info 频道添加成功 !\n"
+            exit 0
+        ;;
+        "ffmpeg") 
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+
+            if [[ ! -x $(command -v curl) ]] 
+            then
+                Println "$info 检查依赖..."
+                CheckRelease > /dev/null
+            fi
+
+            if [ ! -e "$JQ_FILE" ] 
+            then
+                CheckRelease "检查依赖, 耗时可能会很长"
+                InstallJQ
+            fi
+
+            mkdir -p "$FFMPEG_MIRROR_ROOT/builds"
+            mkdir -p "$FFMPEG_MIRROR_ROOT/releases"
+
+            git_download=0
+            release_download=0
+            git_version_old=""
+            release_version_old=""
+
+            if [ -e "$FFMPEG_MIRROR_ROOT/index.html" ] 
+            then
+                while IFS= read -r line
+                do
+                    if [[ $line == *"<th>"* ]] 
+                    then
+                        if [[ $line == *"git"* ]] 
+                        then
+                            git_version_old=$line
+                        else
+                            release_version_old=$line
+                        fi
+                    fi
+                done < "$FFMPEG_MIRROR_ROOT/index.html"
+            fi
+
+            if curl -s -L "https://www.johnvansickle.com/ffmpeg/index.html" -o "$FFMPEG_MIRROR_ROOT/index.html_tmp" 
+            then
+                mv "$FFMPEG_MIRROR_ROOT/index.html_tmp" "$FFMPEG_MIRROR_ROOT/index.html"
+                curl -s -L "https://www.johnvansickle.com/ffmpeg/style.css" -o "$FFMPEG_MIRROR_ROOT/style.css"
+            else
+                Println "$error ffmpeg 查询新版本出错, 无法连接 johnvansickle.com ?"
+            fi
+
+            if [ -e "$FFMPEG_MIRROR_ROOT/index.html" ] 
+            then
+                while IFS= read -r line
+                do
+                    if [[ $line == *"<th>"* ]] 
+                    then
+                        if [[ $line == *"git"* ]] 
+                        then
+                            git_version_new=$line
+                            if [ "$git_version_new" != "$git_version_old" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/builds/ffmpeg-git-amd64-static.tar.xz" ]
+                            then
+                                git_download=1
+                            fi
+                        else
+                            release_version_new=$line
+                            [ "$release_version_new" != "$release_version_old" ] && release_download=1
+                        fi
+                    fi
+
+                    if [[ $line == *"tar.xz"* ]]  
+                    then
+                        if [[ $line == *"git"* ]] && [ "$git_download" -eq 1 ]
+                        then
+                            line=${line#*<td><a href=\"}
+                            git_link=${line%%\" style*}
+                            build_file_name=${git_link##*/}
+                            if [ "$git_version_new" != "$git_version_old" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}" ]
+                            then
+                                Println "$info 下载 $build_file_name ..."
+                                if curl -s -L "$git_link" -o "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}_tmp"
+                                then
+                                    mv "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}_tmp" "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}"
+                                else
+                                    Println "$error ffmpeg git build 下载出错, 无法连接 github ?"
+                                fi
+                            fi
+                        else 
+                            if [ "$release_download" -eq 1 ] 
+                            then
+                                line=${line#*<td><a href=\"}
+                                release_link=${line%%\" style*}
+                                release_file_name=${release_link##*/}
+                                if [ "$release_version_new" != "$release_version_old" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}" ]
+                                then
+                                    Println "$info 下载 $release_file_name ..."
+                                    if curl -s -L "$release_link" -o "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}_tmp"
+                                    then
+                                        mv "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}_tmp" "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}"
+                                    else
+                                        Println "$error ffmpeg release build 下载出错, 无法连接 github ?"
+                                    fi
+                                fi
+                            fi
+                        fi
+                    fi
+                done < "$FFMPEG_MIRROR_ROOT/index.html"
+
+                #Println "输入镜像网站链接(比如: $FFMPEG_MIRROR_LINK)"
+                #read -p "(默认: 取消): " FFMPEG_LINK
+                #[ -z "$FFMPEG_LINK" ] && echo "已取消...\n" && exit 1
+                #sed -i "s+https://johnvansickle.com/ffmpeg/\(builds\|releases\)/\(.*\).tar.xz\"+$FFMPEG_LINK/\1/\2.tar.xz\"+g" "$FFMPEG_MIRROR_ROOT/index.html"
+
+                sed -i "s+https://johnvansickle.com/ffmpeg/\(builds\|releases\)/\(.*\).tar.xz\"+\1/\2.tar.xz\"+g" "$FFMPEG_MIRROR_ROOT/index.html"
+            fi
+
+            while IFS= read -r line
+            do
+                if [[ $line == *"latest stable release is"* ]] 
+                then
+                    line=${line#*<a href=\"}
+                    poppler_name=${line%%.tar.xz*}
+                    poppler_name="poppler-0.81.0"
+                    if [ ! -e "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz" ] 
+                    then
+                        Println "$info 下载 poppler ..."
+                        rm -f "$FFMPEG_MIRROR_ROOT/poppler-"*.tar.xz
+                        if curl -s -L "https://poppler.freedesktop.org/$poppler_name.tar.xz" -o "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz_tmp" 
+                        then
+                            mv "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz_tmp" "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz"
+                        else
+                            Println "$error poppler 下载出错"
+                        fi
+                    fi
+                elif [[ $line == *"poppler encoding data"* ]] 
+                then
+                    line=${line#*<a href=\"}
+                    poppler_data_name=${line%%.tar.gz*}
+                    if [ ! -e "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz" ] 
+                    then
+                        Println "$info 下载 poppler-data ..."
+                        rm -f "$FFMPEG_MIRROR_ROOT/poppler-data-"*.tar.gz
+                        if curl -s -L "https://poppler.freedesktop.org/$poppler_data_name.tar.gz" -o "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz_tmp"
+                        then
+                            mv "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz_tmp" "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz"
+                        else
+                            Println "$error poppler-data 下载出错"
+                        fi
+                    fi
+                    break
+                fi
+            done < <(curl -s -Lm 20 "https://poppler.freedesktop.org/")
+
+            if jq_ver=$(curl -s -Lm 20 "https://api.github.com/repos/stedolan/jq/releases/latest" | $JQ_FILE -r '.tag_name')
+            then
+                if [ ! -e "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32" ] 
+                then
+                    Println "$info 下载 jq ..."
+                    rm -f "$FFMPEG_MIRROR_ROOT/jq-"*
+                    mkdir -p "$FFMPEG_MIRROR_ROOT/$jq_ver/"
+                    if curl -s -L "https://github.com/stedolan/jq/releases/download/$jq_ver/jq-linux64" -o "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64_tmp" && curl -s -L "https://github.com/stedolan/jq/releases/download/$jq_ver/jq-linux32" -o "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32_tmp"
+                    then
+                        mv "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64_tmp" "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64"
+                        mv "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32_tmp" "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32"
+                    else
+                        Println "$error jq 下载出错, 无法连接 github ?"
+                    fi
+                fi
+            else
+                Println "$error jq 下载出错, 无法连接 github ?"
+            fi
+
+            if v2ray_ver=$(curl -s -m 30 "https://api.github.com/repos/v2fly/v2ray-core/releases/latest" | $JQ_FILE -r '.tag_name') 
+            then
+                if [ ! -e "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip" ] 
+                then
+                    Println "$info 下载 v2ray ..."
+                    mkdir -p "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/"
+                    if curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-64.zip" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip_tmp" \
+                    && curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-32.zip" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip_tmp" \
+                    && curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-64.zip.dgst" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip.dgst_tmp" \
+                    && curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-32.zip.dgst" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip.dgst_tmp"
+                    then
+                        mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip"
+                        mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip"
+                        mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip.dgst_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip.dgst"
+                        mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip.dgst_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip.dgst"
+                    else
+                        Println "$error v2ray 下载出错, 无法连接 github ?"
+                    fi
+                fi
+            else
+                Println "$error v2ray 下载出错, 无法连接 github ?"
+            fi
+
+            if dnscrypt_ver=$(curl -s -m 30 "https://api.github.com/repos/DNSCrypt/dnscrypt-proxy/releases/latest" | $JQ_FILE -r '.tag_name') 
+            then
+                if [ ! -e "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz" ]
+                then
+                    Println "$info 下载 dnscrypt proxy ..."
+                    mkdir -p "$FFMPEG_MIRROR_ROOT/dnscrypt/"
+                    if curl -s -L "https://github.com/DNSCrypt/dnscrypt-proxy/releases/download/$dnscrypt_ver/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz" -o "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz_tmp"
+                    then
+                        mv "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz_tmp" "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz"
+                    else
+                        Println "$error dnscrypt 下载出错, 无法连接 github ?"
+                    fi
+                fi
+            else
+                Println "$error dnscrypt 下载出错, 无法连接 github ?"
+            fi
+
+            Println "$info 下载 nginx-http-flv-module ..."
+            if curl -s -L "https://github.com/winshining/nginx-http-flv-module/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/nginx-http-flv-module.zip_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/nginx-http-flv-module.zip_tmp" "$FFMPEG_MIRROR_ROOT/nginx-http-flv-module.zip"
+            else
+                Println "$error nginx-http-flv-module 下载出错, 无法连接 github ?"
+            fi
+
+            Println "$info 下载 imgcat ..."
+            if curl -s -L "https://github.com/eddieantonio/imgcat/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/imgcat.zip_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/imgcat.zip_tmp" "$FFMPEG_MIRROR_ROOT/imgcat.zip"
+            else
+                Println "$error imgcat 下载出错, 无法连接 github ?"
+            fi
+
+            Println "$info 下载 CImg ..."
+            if curl -s -L "https://github.com/dtschump/CImg/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/CImg.zip_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/CImg.zip_tmp" "$FFMPEG_MIRROR_ROOT/CImg.zip"
+            else
+                Println "$error CImg 下载出错, 无法连接 github ?"
+            fi
+
+            if curl -s -L "https://api.github.com/repos/stedolan/jq/releases/latest" -o "$FFMPEG_MIRROR_ROOT/jq.json_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/jq.json_tmp" "$FFMPEG_MIRROR_ROOT/jq.json"
+            else
+                Println "$error jq.json 下载出错, 无法连接 github ?"
+            fi
+
+            if curl -s -L "https://api.github.com/repos/v2fly/v2ray-core/releases/latest" -o "$FFMPEG_MIRROR_ROOT/v2ray.json_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/v2ray.json_tmp" "$FFMPEG_MIRROR_ROOT/v2ray.json"
+            else
+                Println "$error v2ray.json 下载出错, 无法连接 github ?"
+            fi
+
+            if curl -s -L "https://api.github.com/repos/DNSCrypt/dnscrypt-proxy/releases/latest" -o "$FFMPEG_MIRROR_ROOT/dnscrypt.json_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/dnscrypt.json_tmp" "$FFMPEG_MIRROR_ROOT/dnscrypt.json"
+            else
+                Println "$error dnscrypt.json 下载出错, 无法连接 github ?"
+            fi
+
+            if curl -s -L "https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim" -o "$FFMPEG_MIRROR_ROOT/vim-plug.vim_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/vim-plug.vim_tmp" "$FFMPEG_MIRROR_ROOT/vim-plug.vim"
+            else
+                Println "$error vim-plug.vim 下载出错, 无法连接 github ?"
+            fi
+
+            if [ ! -e "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch" ]
+            then
+                if curl -s -L "https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-1.1.1f-sess_set_get_cb_yield.patch" -o "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch_tmp"
+                then
+                    mv "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch_tmp" "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch"
+                else
+                    Println "$error openssl patch 下载出错, 无法连接 github ?"
+                fi
+            fi
+
+            if [ ! -e "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch" ] 
+            then
+                if curl -s -L "https://raw.githubusercontent.com/woniuzfb/iptv/master/scripts/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch" -o "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch_tmp"
+                then
+                    mv "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch_tmp" "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch"
+                else
+                    Println "$error Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch 下载出错, 无法连接 github ?"
+                fi
+            fi
+
+            if curl -s -L "https://raw.githubusercontent.com/woniuzfb/iptv/master/scripts/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch" -o "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch_tmp" "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch"
+            else
+                Println "$error Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch 下载出错, 无法连接 github ?"
+            fi
+
+            if [ ! -e "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz" ] 
+            then
+                if curl -s -L "https://github.com/fontforge/fontforge/releases/download/20190413/fontforge-20190413.tar.gz" -o "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz_tmp"
+                then
+                    mv "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz_tmp" "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz"
+                else
+                    Println "$error fontforge 下载出错, 无法连接 github ?"
+                fi
+            fi
+
+            Println "$info 下载 pdf2htmlEX ..."
+            if [ ! -e "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip" ] 
+            then
+                if curl -s -L "https://github.com/pdf2htmlEX/pdf2htmlEX/archive/v0.18.7-poppler-0.81.0.zip" -o "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip_tmp"
+                then
+                    mv "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip_tmp" "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip"
+                else
+                    Println "$error pdf2htmlEX 下载出错, 无法连接 github ?"
+                fi
+            fi
+
+            Println "$info 下载 v2ray install-release.sh ..."
+            if curl -s -L "$V2_LINK" -o "$FFMPEG_MIRROR_ROOT/v2ray_install-release.sh_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/v2ray_install-release.sh_tmp" "$FFMPEG_MIRROR_ROOT/v2ray_install-release.sh"
+            else
+                Println "$error v2ray install-release.sh 下载出错, 无法连接 github ?"
+            fi
+
+            Println "$info 下载 Amlogic_s905-kernel-master.zip ..."
+            if curl -s -L "https://github.com/150balbes/Amlogic_s905-kernel/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/Amlogic_s905-kernel-master.zip_tmp"
+            then
+                mv "$FFMPEG_MIRROR_ROOT/Amlogic_s905-kernel-master.zip_tmp" "$FFMPEG_MIRROR_ROOT/Amlogic_s905-kernel-master.zip"
+            else
+                Println "$error Amlogic_s905-kernel-master.zip 下载出错, 无法连接 github ?"
+            fi
+            exit 0
+        ;;
+        "ts") 
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+            TsMenu
+            exit 0
+        ;;
+        "f"|"flv") 
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+            kind="flv"
+            color="$blue"
+            shift
+        ;;
+        "v"|"vip") 
+            [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
+            vip=1
+            shift
+        ;;
+        "l"|"ll") 
+            flv_count=0
+            chnls_channel_name=()
+            chnls_stream_link=()
+            chnls_flv_pull_link=()
+            while IFS= read -r flv_channel
+            do
+                flv_count=$((flv_count+1))
+                map_channel_name=${flv_channel#*channel_name: }
+                map_channel_name=${map_channel_name%, stream_link:*}
+                map_stream_link=${flv_channel#*, stream_link: }
+                map_stream_link=${map_stream_link%, flv_pull_link:*}
+                map_flv_pull_link=${flv_channel#*, flv_pull_link: }
+                map_flv_pull_link=${map_flv_pull_link%\"}
+
+                chnls_channel_name+=("$map_channel_name")
+                chnls_stream_link+=("${map_stream_link// /, }")
+                chnls_flv_pull_link+=("${map_flv_pull_link}")
+            done < <($JQ_FILE '.channels | to_entries | map(select(.value.flv_status=="on")) | map("channel_name: \(.value.channel_name), stream_link: \(.value.stream_link), flv_pull_link: \(.value.flv_pull_link)") | .[]' "$CHANNELS_FILE")
+
+            if [ "$flv_count" -gt 0 ] 
+            then
+
+                Println "FLV 频道"
+                result=""
+                for((i=0;i<flv_count;i++));
+                do
+                    chnl_flv_pull_link=${chnls_flv_pull_link[i]}
+                    result=$result"  $green$((i+1)).${normal}\r\033[6C$green${chnls_channel_name[i]}${normal}\n\033[6C源: ${chnls_stream_link[i]}\n\033[6Cpull: ${chnl_flv_pull_link:-无}\n\n"
+                done
+                Println "$result"
+            fi
+
+
+            hls_count=0
+            chnls_channel_name=()
+            chnls_stream_link=()
+            chnls_output_dir_name=()
+            while IFS= read -r hls_channel
+            do
+                hls_count=$((hls_count+1))
+                map_channel_name=${hls_channel#*channel_name: }
+                map_channel_name=${map_channel_name%, stream_link:*}
+                map_stream_link=${hls_channel#*stream_link: }
+                map_stream_link=${map_stream_link%, output_dir_name:*}
+                map_output_dir_name=${hls_channel#*output_dir_name: }
+                map_output_dir_name=${map_output_dir_name%\"}
+
+                chnls_channel_name+=("$map_channel_name")
+                chnls_stream_link+=("${map_stream_link// /, }")
+                chnls_output_dir_name+=("$map_output_dir_name")
+            done < <($JQ_FILE '.channels | to_entries | map(select(.value.status=="on")) | map("channel_name: \(.value.channel_name), stream_link: \(.value.stream_link), output_dir_name: \(.value.output_dir_name)") | .[]' "$CHANNELS_FILE")
+
+            if [ "$hls_count" -gt 0 ] 
+            then
+                Println "HLS 频道"
+                result=""
+                for((i=0;i<hls_count;i++));
+                do
+                    result=$result"  $green$((i+1)).${normal}\r\033[6C$green${chnls_channel_name[i]}${normal}\n\033[6C源: ${chnls_stream_link[i]}\n\n"
+                done
+                Println "$result"
+            fi
+
+            echo 
+
+            for((i=0;i<hls_count;i++));
+            do
+                echo -e "  $green$((i+1)).${normal}\r\033[6C${chnls_channel_name[i]} ${chnls_stream_link[i]}"
+                if [ -e "$LIVE_ROOT/${chnls_output_dir_name[i]}" ] 
+                then
+                    if ls -A "$LIVE_ROOT/${chnls_output_dir_name[i]}"/* > /dev/null 2>&1 
+                    then
+                        ls "$LIVE_ROOT/${chnls_output_dir_name[i]}"/* -lght && echo
+                    else
+                        Println "$error 无\n"
+                    fi
+                else
+                    Println "$error 目录不存在\n"
+                fi
+            done
+
+            if ls -A $LIVE_ROOT/* > /dev/null 2>&1 
+            then
+                for output_dir_root in "$LIVE_ROOT"/*
+                do
+                    found=0
+                    output_dir_name=${output_dir_root#*$LIVE_ROOT/}
+                    for((i=0;i<hls_count;i++));
+                    do
+                        if [ "$output_dir_name" == "${chnls_output_dir_name[i]}" ] 
+                        then
+                            found=1
+                        fi
+                    done
+                    if [ "$found" -eq 0 ] 
+                    then
+                        Println "$error 未知目录 $output_dir_name\n"
+                        if ls -A "$output_dir_root"/* > /dev/null 2>&1 
+                        then
+                            ls "$output_dir_root"/* -lght
+                        fi
+                    fi
+                done
+            fi
+
+            if [ "$flv_count" -eq 0 ] && [ "$hls_count" -eq 0 ]
+            then
+                Println "$error 没有开启的频道 !\n" && exit 1
+            fi
+
+            exit 0
+        ;;
         *)
         ;;
     esac
 fi
 
-cmd=$*
-case "$cmd" in
-    "e") 
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-        vim "$CHANNELS_FILE" && exit 0
-    ;;
-    "ee") 
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-        GetDefault
-        [ -z "$d_sync_file" ] && Println "$error sync_file 未设置, 请检查 !\n" && exit 1
-        vim "${d_sync_file%% *}" && exit 0
-    ;;
-    "d")
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-        channels=""
-        while IFS= read -r line 
-        do
-            if [[ $line == *\"pid\":* ]] 
-            then
-                pid=${line#*:}
-                pid=${pid%,*}
-                rand_pid=$pid
-                while [[ -n $($JQ_FILE '.channels[]|select(.pid=='"$rand_pid"')' "$CHANNELS_FILE") ]] 
-                do
-                    true &
-                    rand_pid=$!
-                done
-                line=${line//$pid/$rand_pid}
-            fi
-            channels="$channels$line"
-        done < <(curl -s -Lm 10 "$DEFAULT_DEMOS")
-        [ -z "$channels" ] && Println "$error 暂时无法连接服务器, 请稍后再试...\n" && exit 1
-        JQ add "$CHANNELS_FILE" channels "$channels"
-        Println "$info 频道添加成功 !\n"
-        exit 0
-    ;;
-    "ffmpeg") 
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-
-        if [[ ! -x $(command -v curl) ]] 
-        then
-            Println "$info 检查依赖..."
-            CheckRelease > /dev/null
-        fi
-
-        if [ ! -e "$JQ_FILE" ] 
-        then
-            CheckRelease "检查依赖, 耗时可能会很长"
-            InstallJQ
-        fi
-
-        mkdir -p "$FFMPEG_MIRROR_ROOT/builds"
-        mkdir -p "$FFMPEG_MIRROR_ROOT/releases"
-
-        git_download=0
-        release_download=0
-        git_version_old=""
-        release_version_old=""
-
-        if [ -e "$FFMPEG_MIRROR_ROOT/index.html" ] 
-        then
-            while IFS= read -r line
-            do
-                if [[ $line == *"<th>"* ]] 
-                then
-                    if [[ $line == *"git"* ]] 
-                    then
-                        git_version_old=$line
-                    else
-                        release_version_old=$line
-                    fi
-                fi
-            done < "$FFMPEG_MIRROR_ROOT/index.html"
-        fi
-
-        if curl -s -L "https://www.johnvansickle.com/ffmpeg/index.html" -o "$FFMPEG_MIRROR_ROOT/index.html_tmp" 
-        then
-            mv "$FFMPEG_MIRROR_ROOT/index.html_tmp" "$FFMPEG_MIRROR_ROOT/index.html"
-            curl -s -L "https://www.johnvansickle.com/ffmpeg/style.css" -o "$FFMPEG_MIRROR_ROOT/style.css"
-        else
-            Println "$error ffmpeg 查询新版本出错, 无法连接 johnvansickle.com ?"
-        fi
-
-        if [ -e "$FFMPEG_MIRROR_ROOT/index.html" ] 
-        then
-            while IFS= read -r line
-            do
-                if [[ $line == *"<th>"* ]] 
-                then
-                    if [[ $line == *"git"* ]] 
-                    then
-                        git_version_new=$line
-                        if [ "$git_version_new" != "$git_version_old" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/builds/ffmpeg-git-amd64-static.tar.xz" ]
-                        then
-                            git_download=1
-                        fi
-                    else
-                        release_version_new=$line
-                        [ "$release_version_new" != "$release_version_old" ] && release_download=1
-                    fi
-                fi
-
-                if [[ $line == *"tar.xz"* ]]  
-                then
-                    if [[ $line == *"git"* ]] && [ "$git_download" -eq 1 ]
-                    then
-                        line=${line#*<td><a href=\"}
-                        git_link=${line%%\" style*}
-                        build_file_name=${git_link##*/}
-                        if [ "$git_version_new" != "$git_version_old" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}" ]
-                        then
-                            Println "$info 下载 $build_file_name ..."
-                            if curl -s -L "$git_link" -o "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}_tmp"
-                            then
-                                mv "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}_tmp" "$FFMPEG_MIRROR_ROOT/builds/${build_file_name}"
-                            else
-                                Println "$error ffmpeg git build 下载出错, 无法连接 github ?"
-                            fi
-                        fi
-                    else 
-                        if [ "$release_download" -eq 1 ] 
-                        then
-                            line=${line#*<td><a href=\"}
-                            release_link=${line%%\" style*}
-                            release_file_name=${release_link##*/}
-                            if [ "$release_version_new" != "$release_version_old" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}" ]
-                            then
-                                Println "$info 下载 $release_file_name ..."
-                                if curl -s -L "$release_link" -o "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}_tmp"
-                                then
-                                    mv "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}_tmp" "$FFMPEG_MIRROR_ROOT/releases/${release_file_name}"
-                                else
-                                    Println "$error ffmpeg release build 下载出错, 无法连接 github ?"
-                                fi
-                            fi
-                        fi
-                    fi
-                fi
-            done < "$FFMPEG_MIRROR_ROOT/index.html"
-
-            #Println "输入镜像网站链接(比如: $FFMPEG_MIRROR_LINK)"
-            #read -p "(默认: 取消): " FFMPEG_LINK
-            #[ -z "$FFMPEG_LINK" ] && echo "已取消...\n" && exit 1
-            #sed -i "s+https://johnvansickle.com/ffmpeg/\(builds\|releases\)/\(.*\).tar.xz\"+$FFMPEG_LINK/\1/\2.tar.xz\"+g" "$FFMPEG_MIRROR_ROOT/index.html"
-
-            sed -i "s+https://johnvansickle.com/ffmpeg/\(builds\|releases\)/\(.*\).tar.xz\"+\1/\2.tar.xz\"+g" "$FFMPEG_MIRROR_ROOT/index.html"
-        fi
-
-        while IFS= read -r line
-        do
-            if [[ $line == *"latest stable release is"* ]] 
-            then
-                line=${line#*<a href=\"}
-                poppler_name=${line%%.tar.xz*}
-                poppler_name="poppler-0.81.0"
-                if [ ! -e "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz" ] 
-                then
-                    Println "$info 下载 poppler ..."
-                    rm -f "$FFMPEG_MIRROR_ROOT/poppler-"*.tar.xz
-                    if curl -s -L "https://poppler.freedesktop.org/$poppler_name.tar.xz" -o "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz_tmp" 
-                    then
-                        mv "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz_tmp" "$FFMPEG_MIRROR_ROOT/$poppler_name.tar.xz"
-                    else
-                        Println "$error poppler 下载出错"
-                    fi
-                fi
-            elif [[ $line == *"poppler encoding data"* ]] 
-            then
-                line=${line#*<a href=\"}
-                poppler_data_name=${line%%.tar.gz*}
-                if [ ! -e "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz" ] 
-                then
-                    Println "$info 下载 poppler-data ..."
-                    rm -f "$FFMPEG_MIRROR_ROOT/poppler-data-"*.tar.gz
-                    if curl -s -L "https://poppler.freedesktop.org/$poppler_data_name.tar.gz" -o "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz_tmp"
-                    then
-                        mv "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz_tmp" "$FFMPEG_MIRROR_ROOT/$poppler_data_name.tar.gz"
-                    else
-                        Println "$error poppler-data 下载出错"
-                    fi
-                fi
-                break
-            fi
-        done < <(curl -s -Lm 20 "https://poppler.freedesktop.org/")
-
-        if jq_ver=$(curl -s -Lm 20 "https://api.github.com/repos/stedolan/jq/releases/latest" | $JQ_FILE -r '.tag_name')
-        then
-            if [ ! -e "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32" ] 
-            then
-                Println "$info 下载 jq ..."
-                rm -f "$FFMPEG_MIRROR_ROOT/jq-"*
-                mkdir -p "$FFMPEG_MIRROR_ROOT/$jq_ver/"
-                if curl -s -L "https://github.com/stedolan/jq/releases/download/$jq_ver/jq-linux64" -o "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64_tmp" && curl -s -L "https://github.com/stedolan/jq/releases/download/$jq_ver/jq-linux32" -o "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32_tmp"
-                then
-                    mv "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64_tmp" "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux64"
-                    mv "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32_tmp" "$FFMPEG_MIRROR_ROOT/$jq_ver/jq-linux32"
-                else
-                    Println "$error jq 下载出错, 无法连接 github ?"
-                fi
-            fi
-        else
-            Println "$error jq 下载出错, 无法连接 github ?"
-        fi
-
-        if v2ray_ver=$(curl -s -m 30 "https://api.github.com/repos/v2ray/v2ray-core/releases/latest" | $JQ_FILE -r '.tag_name') 
-        then
-            if [ ! -e "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip" ] || [ ! -e "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip" ] 
-            then
-                Println "$info 下载 v2ray ..."
-                mkdir -p "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/"
-                if curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-64.zip" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip_tmp" \
-                && curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-32.zip" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip_tmp" \
-                && curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-64.zip.dgst" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip.dgst_tmp" \
-                && curl -s -L "https://github.com/v2fly/v2ray-core/releases/download/$v2ray_ver/v2ray-linux-32.zip.dgst" -o "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip.dgst_tmp"
-                then
-                    mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip"
-                    mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip"
-                    mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip.dgst_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-64.zip.dgst"
-                    mv "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip.dgst_tmp" "$FFMPEG_MIRROR_ROOT/v2ray/$v2ray_ver/v2ray-linux-32.zip.dgst"
-                else
-                    Println "$error v2ray 下载出错, 无法连接 github ?"
-                fi
-            fi
-        else
-            Println "$error v2ray 下载出错, 无法连接 github ?"
-        fi
-
-        if dnscrypt_ver=$(curl -s -m 30 "https://api.github.com/repos/DNSCrypt/dnscrypt-proxy/releases/latest" | $JQ_FILE -r '.tag_name') 
-        then
-            if [ ! -e "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz" ]
-            then
-                Println "$info 下载 dnscrypt proxy ..."
-                mkdir -p "$FFMPEG_MIRROR_ROOT/dnscrypt/"
-                if curl -s -L "https://github.com/DNSCrypt/dnscrypt-proxy/releases/download/$dnscrypt_ver/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz" -o "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz_tmp"
-                then
-                    mv "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz_tmp" "$FFMPEG_MIRROR_ROOT/dnscrypt/dnscrypt-proxy-linux_arm64-$dnscrypt_ver.tar.gz"
-                else
-                    Println "$error dnscrypt 下载出错, 无法连接 github ?"
-                fi
-            fi
-        else
-            Println "$error dnscrypt 下载出错, 无法连接 github ?"
-        fi
-
-        Println "$info 下载 nginx-http-flv-module ..."
-        if curl -s -L "https://github.com/winshining/nginx-http-flv-module/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/nginx-http-flv-module.zip_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/nginx-http-flv-module.zip_tmp" "$FFMPEG_MIRROR_ROOT/nginx-http-flv-module.zip"
-        else
-            Println "$error nginx-http-flv-module 下载出错, 无法连接 github ?"
-        fi
-
-        Println "$info 下载 imgcat ..."
-        if curl -s -L "https://github.com/eddieantonio/imgcat/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/imgcat.zip_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/imgcat.zip_tmp" "$FFMPEG_MIRROR_ROOT/imgcat.zip"
-        else
-            Println "$error imgcat 下载出错, 无法连接 github ?"
-        fi
-
-        Println "$info 下载 CImg ..."
-        if curl -s -L "https://github.com/dtschump/CImg/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/CImg.zip_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/CImg.zip_tmp" "$FFMPEG_MIRROR_ROOT/CImg.zip"
-        else
-            Println "$error CImg 下载出错, 无法连接 github ?"
-        fi
-
-        if curl -s -L "https://api.github.com/repos/stedolan/jq/releases/latest" -o "$FFMPEG_MIRROR_ROOT/jq.json_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/jq.json_tmp" "$FFMPEG_MIRROR_ROOT/jq.json"
-        else
-            Println "$error jq.json 下载出错, 无法连接 github ?"
-        fi
-
-        if curl -s -L "https://api.github.com/repos/v2ray/v2ray-core/releases/latest" -o "$FFMPEG_MIRROR_ROOT/v2ray.json_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/v2ray.json_tmp" "$FFMPEG_MIRROR_ROOT/v2ray.json"
-        else
-            Println "$error v2ray.json 下载出错, 无法连接 github ?"
-        fi
-
-        if curl -s -L "https://api.github.com/repos/DNSCrypt/dnscrypt-proxy/releases/latest" -o "$FFMPEG_MIRROR_ROOT/dnscrypt.json_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/dnscrypt.json_tmp" "$FFMPEG_MIRROR_ROOT/dnscrypt.json"
-        else
-            Println "$error dnscrypt.json 下载出错, 无法连接 github ?"
-        fi
-
-        if curl -s -L "https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim" -o "$FFMPEG_MIRROR_ROOT/vim-plug.vim_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/vim-plug.vim_tmp" "$FFMPEG_MIRROR_ROOT/vim-plug.vim"
-        else
-            Println "$error vim-plug.vim 下载出错, 无法连接 github ?"
-        fi
-
-        if [ ! -e "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch" ]
-        then
-            if curl -s -L "https://raw.githubusercontent.com/openresty/openresty/master/patches/openssl-1.1.1f-sess_set_get_cb_yield.patch" -o "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch_tmp"
-            then
-                mv "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch_tmp" "$FFMPEG_MIRROR_ROOT/openssl-1.1.1f-sess_set_get_cb_yield.patch"
-            else
-                Println "$error openssl patch 下载出错, 无法连接 github ?"
-            fi
-        fi
-
-        if [ ! -e "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch" ] 
-        then
-            if curl -s -L "https://raw.githubusercontent.com/woniuzfb/iptv/master/scripts/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch" -o "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch_tmp"
-            then
-                mv "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch_tmp" "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch"
-            else
-                Println "$error Add-SVT-HEVC-support-for-RTMP-and-HLS-on-Nginx-HTTP-FLV.patch 下载出错, 无法连接 github ?"
-            fi
-        fi
-
-        if curl -s -L "https://raw.githubusercontent.com/woniuzfb/iptv/master/scripts/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch" -o "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch_tmp" "$FFMPEG_MIRROR_ROOT/Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch"
-        else
-            Println "$error Add-SVT-HEVC-FLV-support-on-FFmpeg-git.patch 下载出错, 无法连接 github ?"
-        fi
-
-        if [ ! -e "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz" ] 
-        then
-            if curl -s -L "https://github.com/fontforge/fontforge/releases/download/20190413/fontforge-20190413.tar.gz" -o "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz_tmp"
-            then
-                mv "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz_tmp" "$FFMPEG_MIRROR_ROOT/fontforge-20190413.tar.gz"
-            else
-                Println "$error fontforge 下载出错, 无法连接 github ?"
-            fi
-        fi
-
-        Println "$info 下载 pdf2htmlEX ..."
-        if [ ! -e "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip" ] 
-        then
-            if curl -s -L "https://github.com/pdf2htmlEX/pdf2htmlEX/archive/v0.18.7-poppler-0.81.0.zip" -o "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip_tmp"
-            then
-                mv "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip_tmp" "$FFMPEG_MIRROR_ROOT/pdf2htmlEX-0.18.7-poppler-0.81.0.zip"
-            else
-                Println "$error pdf2htmlEX 下载出错, 无法连接 github ?"
-            fi
-        fi
-
-        Println "$info 下载 v2ray install-release.sh ..."
-        if curl -s -L "$V2_LINK" -o "$FFMPEG_MIRROR_ROOT/v2ray_install-release.sh_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/v2ray_install-release.sh_tmp" "$FFMPEG_MIRROR_ROOT/v2ray_install-release.sh"
-        else
-            Println "$error v2ray install-release.sh 下载出错, 无法连接 github ?"
-        fi
-
-        Println "$info 下载 Amlogic_s905-kernel-master.zip ..."
-        if curl -s -L "https://github.com/150balbes/Amlogic_s905-kernel/archive/master.zip" -o "$FFMPEG_MIRROR_ROOT/Amlogic_s905-kernel-master.zip_tmp"
-        then
-            mv "$FFMPEG_MIRROR_ROOT/Amlogic_s905-kernel-master.zip_tmp" "$FFMPEG_MIRROR_ROOT/Amlogic_s905-kernel-master.zip"
-        else
-            Println "$error Amlogic_s905-kernel-master.zip 下载出错, 无法连接 github ?"
-        fi
-        exit 0
-    ;;
-    "ts") 
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-        TsMenu
-        exit 0
-    ;;
-    "f"|"flv") 
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-        kind="flv"
-        color="$blue"
-    ;;
-    "v"|"vip") 
-        [ ! -d "$IPTV_ROOT" ] && Println "$error 尚未安装, 请检查 !\n" && exit 1
-        vip=1
-    ;;
-    "l"|"ll") 
-        flv_count=0
-        chnls_channel_name=()
-        chnls_stream_link=()
-        chnls_flv_pull_link=()
-        while IFS= read -r flv_channel
-        do
-            flv_count=$((flv_count+1))
-            map_channel_name=${flv_channel#*channel_name: }
-            map_channel_name=${map_channel_name%, stream_link:*}
-            map_stream_link=${flv_channel#*, stream_link: }
-            map_stream_link=${map_stream_link%, flv_pull_link:*}
-            map_flv_pull_link=${flv_channel#*, flv_pull_link: }
-            map_flv_pull_link=${map_flv_pull_link%\"}
-
-            chnls_channel_name+=("$map_channel_name")
-            chnls_stream_link+=("${map_stream_link// /, }")
-            chnls_flv_pull_link+=("${map_flv_pull_link}")
-        done < <($JQ_FILE '.channels | to_entries | map(select(.value.flv_status=="on")) | map("channel_name: \(.value.channel_name), stream_link: \(.value.stream_link), flv_pull_link: \(.value.flv_pull_link)") | .[]' "$CHANNELS_FILE")
-
-        if [ "$flv_count" -gt 0 ] 
-        then
-
-            Println "FLV 频道"
-            result=""
-            for((i=0;i<flv_count;i++));
-            do
-                chnl_flv_pull_link=${chnls_flv_pull_link[i]}
-                result=$result"  $green$((i+1)).${normal}\r\033[6C$green${chnls_channel_name[i]}${normal}\n\r\033[6C源: ${chnls_stream_link[i]}\n\r\033[6Cpull: ${chnl_flv_pull_link:-无}\n\n"
-            done
-            Println "$result"
-        fi
-
-
-        hls_count=0
-        chnls_channel_name=()
-        chnls_stream_link=()
-        chnls_output_dir_name=()
-        while IFS= read -r hls_channel
-        do
-            hls_count=$((hls_count+1))
-            map_channel_name=${hls_channel#*channel_name: }
-            map_channel_name=${map_channel_name%, stream_link:*}
-            map_stream_link=${hls_channel#*stream_link: }
-            map_stream_link=${map_stream_link%, output_dir_name:*}
-            map_output_dir_name=${hls_channel#*output_dir_name: }
-            map_output_dir_name=${map_output_dir_name%\"}
-
-            chnls_channel_name+=("$map_channel_name")
-            chnls_stream_link+=("${map_stream_link// /, }")
-            chnls_output_dir_name+=("$map_output_dir_name")
-        done < <($JQ_FILE '.channels | to_entries | map(select(.value.status=="on")) | map("channel_name: \(.value.channel_name), stream_link: \(.value.stream_link), output_dir_name: \(.value.output_dir_name)") | .[]' "$CHANNELS_FILE")
-
-        if [ "$hls_count" -gt 0 ] 
-        then
-            Println "HLS 频道"
-            result=""
-            for((i=0;i<hls_count;i++));
-            do
-                result=$result"  $green$((i+1)).${normal}\r\033[6C$green${chnls_channel_name[i]}${normal}\n\r\033[6C源: ${chnls_stream_link[i]}\n\n"
-            done
-            Println "$result"
-        fi
-
-        echo 
-
-        for((i=0;i<hls_count;i++));
-        do
-            echo -e "  $green$((i+1)).${normal}\r\033[6C${chnls_channel_name[i]} ${chnls_stream_link[i]}"
-            if [ -e "$LIVE_ROOT/${chnls_output_dir_name[i]}" ] 
-            then
-                if ls -A "$LIVE_ROOT/${chnls_output_dir_name[i]}"/* > /dev/null 2>&1 
-                then
-                    ls "$LIVE_ROOT/${chnls_output_dir_name[i]}"/* -lght && echo
-                else
-                    Println "$error 无\n"
-                fi
-            else
-                Println "$error 目录不存在\n"
-            fi
-        done
-
-        if ls -A $LIVE_ROOT/* > /dev/null 2>&1 
-        then
-            for output_dir_root in "$LIVE_ROOT"/*
-            do
-                found=0
-                output_dir_name=${output_dir_root#*$LIVE_ROOT/}
-                for((i=0;i<hls_count;i++));
-                do
-                    if [ "$output_dir_name" == "${chnls_output_dir_name[i]}" ] 
-                    then
-                        found=1
-                    fi
-                done
-                if [ "$found" -eq 0 ] 
-                then
-                    Println "$error 未知目录 $output_dir_name\n"
-                    if ls -A "$output_dir_root"/* > /dev/null 2>&1 
-                    then
-                        ls "$output_dir_root"/* -lght
-                    fi
-                fi
-            done
-        fi
-
-        if [ "$flv_count" -eq 0 ] && [ "$hls_count" -eq 0 ]
-        then
-            Println "$error 没有开启的频道 !\n" && exit 1
-        fi
-
-        exit 0
-    ;;
-    *)
-    ;;
-esac
-
-use_menu=1
-
-while getopts "i:l:P:o:p:S:t:s:c:v:a:f:d:q:b:k:K:m:n:z:H:T:L:Ce" flag
-do
-    use_menu=0
-    case "$flag" in
-        i) stream_link="$OPTARG";;
-        l) live_yn="no";;
-        P) proxy="$OPTARG";;
-        o) output_dir_name="$OPTARG";;
-        p) playlist_name="$OPTARG";;
-        S) seg_dir_name="$OPTARG";;
-        t) seg_name="$OPTARG";;
-        s) seg_length="$OPTARG";;
-        c) seg_count="$OPTARG";;
-        v) video_codec="$OPTARG";;
-        a) audio_codec="$OPTARG";;
-        f) video_audio_shift="$OPTARG";;
-        d) txt_format="$OPTARG";;
-        q) quality="$OPTARG";;
-        b) bitrates="$OPTARG";;
-        C) const="-C";;
-        e) encrypt="-e";;
-        k) kind="$OPTARG";;
-        K) key_name="$OPTARG";;
-        m) input_flags="$OPTARG";;
-        n) output_flags="$OPTARG";;
-        z) channel_name="$OPTARG";;
-        H) flv_h265_yn="yes";;
-        T) flv_push_link="$OPTARG";;
-        L) flv_pull_link="$OPTARG";;
-        *) Usage;
-    esac
-done
-
-if [ "$use_menu" == "1" ]
+if [ -z "$*" ]
 then
     CheckShFile
     if [ "${vip:-0}" -eq 1 ] 
@@ -35511,6 +36580,37 @@ then
         Menu
     fi
 else
+    while getopts "i:l:P:o:p:S:t:s:c:v:a:f:d:q:b:k:K:m:n:z:H:T:L:Ce" flag
+    do
+        case "$flag" in
+            i) stream_link="$OPTARG";;
+            l) live_yn="no";;
+            P) proxy="$OPTARG";;
+            o) output_dir_name="$OPTARG";;
+            p) playlist_name="$OPTARG";;
+            S) seg_dir_name="$OPTARG";;
+            t) seg_name="$OPTARG";;
+            s) seg_length="$OPTARG";;
+            c) seg_count="$OPTARG";;
+            v) video_codec="$OPTARG";;
+            a) audio_codec="$OPTARG";;
+            f) video_audio_shift="$OPTARG";;
+            d) txt_format="$OPTARG";;
+            q) quality="$OPTARG";;
+            b) bitrates="$OPTARG";;
+            C) const="-C";;
+            e) encrypt="-e";;
+            k) kind="$OPTARG";;
+            K) key_name="$OPTARG";;
+            m) input_flags="$OPTARG";;
+            n) output_flags="$OPTARG";;
+            z) channel_name="$OPTARG";;
+            H) flv_h265_yn="yes";;
+            T) flv_push_link="$OPTARG";;
+            L) flv_pull_link="$OPTARG";;
+            *) Usage;
+        esac
+    done
     if [ -z "${stream_link:-}" ]
     then
         Usage
